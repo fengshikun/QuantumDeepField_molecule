@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import argparse
 import os
 from pathlib import Path
@@ -13,18 +12,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
-
+import copy
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output,
-                 hidden_HK, layer_HK,):
+                 hidden_HK, layer_HK):
         super(QuantumDeepField, self).__init__()
 
         """All learning parameters of the QDF model."""
         self.coefficient = nn.Embedding(N_orbitals, dim)
         self.zeta = nn.Embedding(N_orbitals, 1)  # Orbital exponent.
         nn.init.ones_(self.zeta.weight)  # Initialize each zeta with one.
+        self.W_pre_func = nn.Linear(1, dim) #should not be like this!
         self.W_functional = nn.ModuleList([nn.Linear(dim, dim)
                                            for _ in range(layer_functional)])
         self.W_property = nn.Linear(dim, N_output)
@@ -67,7 +68,7 @@ class QuantumDeepField(nn.Module):
         return pad_matrices
 
     def basis_matrix(self, atomic_orbitals,
-                     distance_matrices, quantum_numbers):
+                     distance_matrices, quantum_numbers, laplace):
         """Transform the distance matrix into a basis matrix,
         in which each element is d^(q-1)*e^(-z*d^2), where d is the distance,
         q is the principle quantum number, and z is the orbital exponent.
@@ -78,35 +79,45 @@ class QuantumDeepField(nn.Module):
         zetas = torch.squeeze(self.zeta(atomic_orbitals))
         GTOs = (distance_matrices**(quantum_numbers-1) *
                 torch.exp(-zetas*distance_matrices**2))
-        GTOs = F.normalize(GTOs, 2, 0)
-        # print(torch.sum(torch.t(GTOs)[0]**2))  # Normalization check.
-        return GTOs
-
-    def LCAO(self, inputs):
+        denom = GTOs.norm(2, 0, True).clamp_min(1e-12).expand_as(GTOs)
+        n_GTOs = GTOs/denom
+        g_GTOs = (distance_matrices**(quantum_numbers-2) * torch.exp(-zetas*distance_matrices**2)) * (-2*zetas*distance_matrices**2 +quantum_numbers-1)
+        g_GTOs = g_GTOs/denom
+        if laplace == False:
+            return n_GTOs, g_GTOs
+        else:
+            """A laplace Gaussian-type orbital (GTO)        """
+            l_GTOs = (distance_matrices**(quantum_numbers-3) *
+                torch.exp(-zetas*distance_matrices**2)) * (4*zetas**2*distance_matrices**4
+                -2*zetas*(2*quantum_numbers+1)*distance_matrices**2
+                       +quantum_numbers*(quantum_numbers-1)) #should not be like this!
+            return l_GTOs/denom, g_GTOs
+            
+    def LCAO(self, inputs,laplace=True):
         """Linear combination of atomic orbitals (LCAO)."""
 
         """Inputs."""
         (atomic_orbitals, distance_matrices,
          quantum_numbers, N_electrons, N_fields) = inputs
-
+         
         """Cat or pad each input data for batch processing."""
         atomic_orbitals = self.list_to_batch(atomic_orbitals, torch.LongTensor)
         distance_matrices = self.pad(distance_matrices, 1e6)
         quantum_numbers = self.list_to_batch(quantum_numbers, cat=True, axis=1)
         N_electrons = self.list_to_batch(N_electrons)
-
+        
         """Normalize the coefficients in LCAO."""
         coefficients = []
         for AOs in atomic_orbitals:
             coefs = F.normalize(self.coefficient(AOs), 2, 0)
-            # print(torch.sum(torch.t(coefs)[0]**2))  # Normalization check.
             coefficients.append(coefs)
         coefficients = torch.cat(coefficients)
+        
         atomic_orbitals = torch.cat(atomic_orbitals)
-
+        
         """LCAO."""
-        basis_matrix = self.basis_matrix(atomic_orbitals,
-                                         distance_matrices, quantum_numbers)
+        basis_matrix, g_GTOs = self.basis_matrix(atomic_orbitals,
+                                         distance_matrices, quantum_numbers,laplace = False)
         molecular_orbitals = torch.matmul(basis_matrix, coefficients)
 
         """We simply normalize the molecular orbitals
@@ -115,15 +126,45 @@ class QuantumDeepField(nn.Module):
         """
         split_MOs = torch.split(molecular_orbitals, N_fields)
         normalized_MOs = []
+        denom_list = []
         for N_elec, MOs in zip(N_electrons, split_MOs):
-            MOs = torch.sqrt(N_elec/self.dim) * F.normalize(MOs, 2, 0)
-            # print(torch.sum(MOs**2), N_elec)  # Total electrons check.
+            eps = 1e-12
+            denom = MOs.norm(2, 0, True).clamp_min(eps).expand_as(MOs)
+            n_MTOs = MOs / denom
+            MOs = torch.sqrt(N_elec / self.dim) * n_MTOs
+            denom_list.append(denom)
             normalized_MOs.append(MOs)
+        if laplace == False:
+            return torch.cat(normalized_MOs),1
+        else :
+            basis_matrix, g_basis_matrix = self.basis_matrix(atomic_orbitals,
+                                         distance_matrices, quantum_numbers,laplace = True)
+            molecular_orbitals = torch.matmul(basis_matrix, coefficients)
+            split_MOs = torch.split(molecular_orbitals, N_fields)
+            normalized_MOs = []
+            index = 0
+            for N_elec, MOs in zip(N_electrons, split_MOs):
+                n_MTOs = MOs / denom_list[index]
+                MOs = torch.sqrt(N_elec / self.dim) * n_MTOs
+                normalized_MOs.append(MOs)
+                index += 1
+            g_molecular_orbitals = torch.matmul(g_basis_matrix, coefficients)
+            g_split_MOs = torch.split(g_molecular_orbitals, N_fields)
+            g_normalized_MOs = []
+            index = 0
+            for N_elec, MOs in zip(N_electrons, g_split_MOs):
+                n_MTOs = MOs / denom_list[index]
+                MOs = torch.sqrt(N_elec / self.dim) * n_MTOs
+                g_normalized_MOs.append(MOs)
+                index += 1
 
-        return torch.cat(normalized_MOs)
+            return torch.cat(normalized_MOs), torch.cat(g_normalized_MOs)
+            
+
 
     def functional(self, vectors, layers, operation, axis):
         """DNN-based energy functional."""
+        #vectors = self.W_pre_func(vectors)
         for l in range(layers):
             vectors = torch.relu(self.W_functional[l](vectors))
         if operation == 'sum':
@@ -132,14 +173,14 @@ class QuantumDeepField(nn.Module):
             vectors = [torch.mean(vs, 0) for vs in torch.split(vectors, axis)]
         return torch.stack(vectors)
 
-    def HKmap(self, scalars, layers):
-        """DNN-based Hohenberg--Kohn map."""
+    def hxcmap(self, scalars, layers):
+        """DNN-based map from desity to exchange-correlation potential."""
         vectors = self.W_density(scalars)
         for l in range(layers):
             vectors = torch.relu(self.W_HK[l](vectors))
         return self.W_potential(vectors)
 
-    def forward(self, data, train=False, target=None, predict=False):
+    def forward(self, data, epsilon = [],  epoch = 0, train=False, target=None, predict=False):
         """Forward computation of the QDF model
         using the above defined functions.
         """
@@ -148,7 +189,7 @@ class QuantumDeepField(nn.Module):
 
         if predict:  # For demo.
             with torch.no_grad():
-                molecular_orbitals = self.LCAO(inputs)
+                molecular_orbitals, temp = self.LCAO(inputs,laplace = False)
                 final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
                                               self.operation, N_fields)
@@ -156,26 +197,82 @@ class QuantumDeepField(nn.Module):
                 return idx, E_
 
         elif train:
-            molecular_orbitals = self.LCAO(inputs)
-            if target == 'E':  # Supervised learning for energy.
-                E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
-                final_layer = self.functional(molecular_orbitals,
-                                              self.layer_functional,
-                                              self.operation, N_fields)
-                E_ = self.W_property(final_layer)  # Predicted E.
-                loss = F.mse_loss(E, E_)
-            if target == 'V':  # Unsupervised learning for potential.
-                V = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
-                densities = torch.sum(molecular_orbitals**2, 1)
-                densities = torch.unsqueeze(densities, 1)
-                V_ = self.HKmap(densities, self.layer_HK)  # Predicted V.
-                loss = F.mse_loss(V, V_)
+            E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
+            l_molecular_orbitals, g_molecular_orbitals = self.LCAO(inputs,laplace = True)
+            molecular_orbitals, temp = self.LCAO(inputs,laplace = False) 
+            V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
+            densities = torch.sum(molecular_orbitals ** 2, 1)
+            densities = torch.unsqueeze(densities, 1)
+            '''final_layer = self.functional(densities,
+                                          self.layer_functional,
+                                          self.operation, N_fields)'''
+            final_layer = self.functional(molecular_orbitals,
+                                        self.layer_functional,
+                                        self.operation, N_fields)
+            E_xcH = self.W_property(final_layer)
+            grad_v = []
+            batch_num = len(data[2])
+            for i in range(batch_num):
+                grad_v.append(torch.autograd.grad(outputs=E_xcH[i], inputs=molecular_orbitals, retain_graph=True)[0])
+            V_xcH = grad_v[0]
+            dim_num = 0
+            for i in range(batch_num):
+                V_xcH[dim_num:dim_num + data[2][i].shape[0]] = grad_v[i][dim_num:dim_num + data[2][i].shape[0]]
+                dim_num += data[2][i].shape[0]
+            V = V_xcH + V_n  # Predicted V.
+#            temp_mul = torch.sum(2*molecular_orbitals * g_molecular_orbitals, 1).reshape(-1, 1)
+#            E_n = V_n * temp_mul
+            E_n = V_n * densities
+            E_n = [torch.sum(vs, 0) for vs in torch.split(E_n, N_fields)]
+            E_n = torch.stack(E_n)
+            E_ = E_xcH + E_n
+#            E_ = E_xcH
+#            f = open('E_xcH.txt', 'a+')
+#            f.write(str(E_xcH))
+#            f.write('\n')
+#            '''f = open('final_layer.txt', 'a+')
+#            f.write(str(final_layer))
+#            f.write('\n')'''
+#            f = open('V_xcH.txt', 'a+')
+#            f.write(str(V_xcH))
+#            f.write('\n')
+#            f = open('V_n.txt', 'a+')
+#            f.write(str(V_n))
+#            f.write('\n')
+#            f = open('E_n.txt', 'a+')
+#            f.write(str(E_n))
+#            f.write('\n')
+#            '''print("molecular.shape: ", molecular_orbitals.shape)
+#            print("V_n.shape: ", V_n.shape)
+#            print("densities.shape: ", densities.shape)
+#            print("E_xch.shape: ", E_xcH.shape)
+#            print("E.shape: ", E.shape)
+#            print("V_xch.shape: ", V_xcH.shape)
+#            print("E_n.shape: ", E_n.shape)
+#            print("E.shape: ", E.shape)'''
+            loss1 = F.mse_loss(E, E_)
+            temp_loss = []
+            dim_num = 0
+            for i in range(batch_num):
+                #I don't know why it occurs wrongs, it tell me RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation. Solve: I copy the epsilon[i], make them point to different address
+                epis = copy.copy(epsilon[i])
+                temp_op2 = molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone()*epis
+                temp_loss.append(F.mse_loss(V[dim_num:dim_num + data[2][i].shape[0]].clone()*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone()-1/2*l_molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone(),temp_op2))
+                dim_num +=data[2][i].shape[0]
+            loss2 = sum(temp_loss)
+            if (epoch%2==1):
+                #loss = loss1
+                loss = loss1
+            else:
+                loss = loss2
+#            loss = loss1 + alpha*loss2
+#            loss = loss1
             return loss
 
         else:  # Test.
             with torch.no_grad():
                 E = self.list_to_batch(data[6], cat=True, axis=0)
-                molecular_orbitals = self.LCAO(inputs)
+                molecular_orbitals, temp = self.LCAO(inputs, laplace = False)
                 final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
                                               self.operation, N_fields)
@@ -195,18 +292,33 @@ class Trainer(object):
         loss.backward()
         optimizer.step()
 
-    def train(self, dataloader):
+    def train(self, dataloader, epoch):
         """Minimize two loss functions in terms of E and V."""
-        losses_E, losses_V = 0, 0
+        losses = 0
         for data in dataloader:
-            loss_E = self.model.forward(data, train=True, target='E')
-            self.optimize(loss_E, self.optimizer)
-            losses_E += loss_E.item()
-            loss_V = self.model.forward(data, train=True, target='V')
-            self.optimize(loss_V, self.optimizer)
-            losses_V += loss_V.item()
+            #1 we solve epsilon for each molecular, there are batch_size moleculars
+            inputs = data[1:6]
+            molecular_orbitals, temp = self.model.LCAO(inputs,laplace = False)
+            V_n = self.model.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
+            densities = torch.sum(molecular_orbitals ** 2, 1)
+            densities = torch.unsqueeze(densities, 1)
+            V_xcH = self.model.hxcmap(densities, self.model.layer_HK) #should not be like this!
+            V = V_xcH + V_n  
+            l_molecular_orbitals, temp = self.model.LCAO(inputs, laplace = True)   
+            batch_num = len(data[2])
+            epsilon = []
+            dim_num = 0
+            for i in range(batch_num):
+                num1 = ((V[dim_num:dim_num + data[2][i].shape[0]]*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]-1/2*l_molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]])*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]).sum()
+                num2 = (molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]).sum()
+                dim_num += data[2][i].shape[0]
+                epsilon.append(num1/num2)
+            #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward
+            loss= self.model.forward(data, epsilon, epoch, train=True, target='E')
+            self.optimize(loss, self.optimizer)
+            losses += loss.item()
         self.scheduler.step()
-        return losses_E, losses_V
+        return losses
 
 
 class Tester(object):
@@ -334,9 +446,10 @@ if __name__ == "__main__":
     """Create the dataloaders of training, val, and test set."""
     dir_dataset = '../dataset/' + dataset + '/'
     field = '_'.join([basis_set, radius + 'sphere', grid_interval + 'grid/'])
-    dataset_train = MyDataset(dir_dataset + 'train_' + field)
-    dataset_val = MyDataset(dir_dataset + 'val_' + field)
-    dataset_test = MyDataset(dir_dataset + 'test_' + field)
+    
+    dataset_train = MyDataset('/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/under15_train/')
+    dataset_val = MyDataset('/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/under15_valid/')
+    dataset_test = MyDataset('/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/under15_test/')
     dataloader_train = mydataloader(dataset_train, batch_size, num_workers,
                                     shuffle=True)
     dataloader_val = mydataloader(dataset_val, batch_size, num_workers)
@@ -350,6 +463,7 @@ if __name__ == "__main__":
     with open(dir_dataset + 'orbitaldict_' + basis_set + '.pickle', 'rb') as f:
         orbital_dict = pickle.load(f)
     N_orbitals = len(orbital_dict)
+    
 
     """The output dimension in regression.
     When we learn only the atomization energy, N_output=1;
@@ -385,7 +499,7 @@ if __name__ == "__main__":
     start = timeit.default_timer()
 
     for epoch in range(iteration):
-        loss_E, loss_V = trainer.train(dataloader_train)
+        loss= trainer.train(dataloader_train, epoch)
         MAE_val = tester.test(dataloader_val)[0]
         MAE_test, prediction = tester.test(dataloader_test)
         time = timeit.default_timer() - start
@@ -399,8 +513,22 @@ if __name__ == "__main__":
             print('-'*50)
             print(result)
 
-        result = '\t'.join(map(str, [epoch, time, loss_E, loss_V,
+        result = '\t'.join(map(str, [epoch, time, loss,
                                      MAE_val, MAE_test]))
+        f = open('loss.txt', 'a+')
+        f.write(str(epoch))
+        f.write('\n')
+        f.write(str(loss))
+        f.write('\n')
+
+        #save result for each epoch
+        f = open('MAE_val.txt', 'a+')
+        f.write(str(MAE_val))
+        f.write('\n')
+        f = open('MAE_test.txt', 'a+')
+        f.write(MAE_test)
+        f.write('\n')
+
         tester.save_result(result, file_result)
         tester.save_prediction(prediction, file_prediction)
         tester.save_model(model, file_model)

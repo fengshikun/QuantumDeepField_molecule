@@ -62,27 +62,32 @@ def create_distancematrix(coords1, coords2):
     return np.where(distance_matrix == 0.0, 1e6, distance_matrix)
 
 
-def create_potential(distance_matrix, atomic_numbers):
+'''def create_potential(distance_matrix, atomic_numbers):
     """Create the Gaussian external potential used in Brockherde et al., 2017,
     Bypassing the Kohn-Sham equations with machine learning.
     """
     Gaussians = np.exp(-distance_matrix**2)
-    return -np.matmul(Gaussians, atomic_numbers)
+    return -np.matmul(Gaussians, atomic_numbers)'''
+def create_potential(distance_matrix, atomic_numbers):#The problem of unit conversion 
+    """Create the external potential, where Vn=-Z/|r-R|"""
+    non_Gaussians = 1/np.abs(distance_matrix)
+    return -np.matmul(non_Gaussians, atomic_numbers)
 
 
 def create_dataset(dir_dataset, filename, basis_set,
                    radius, grid_interval, orbital_dict, property=True):
 
     """Directory of a preprocessed dataset."""
-    if property:
+    '''if property:
         dir_preprocess = (dir_dataset + filename + '_' + basis_set + '_' +
                           str(radius) + 'sphere_' +
                           str(grid_interval) + 'grid/')
     else:  # For demo.
         dir_preprocess = filename + '/'
-    os.makedirs(dir_preprocess, exist_ok=True)
-
+    os.makedirs(dir_preprocess, exist_ok=True)'''
     """Basis set."""
+    dir_path = '/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/' + filename + '/'
+    os.makedirs(dir_path, exist_ok=True)
     inner_outer = [int(b) for b in basis_set[:-1].replace('-', '')]
     inner, outer = inner_outer[0], sum(inner_outer[1:])
 
@@ -90,14 +95,14 @@ def create_dataset(dir_dataset, filename, basis_set,
     sphere = create_sphere(radius, grid_interval)
 
     """Load a dataset."""
-    with open(dir_dataset + filename + '.txt', 'r') as f:
+    dir_preprocess = '/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/'
+    with open(dir_preprocess + filename + '.txt', 'r') as f:
         dataset = f.read().strip().split('\n\n')
 
     N = len(dataset)
     percent = 10
 
     for n, data in enumerate(dataset):
-
         if 100*n/N >= percent:
             print(str(percent) + '％ has finished.')
             percent += 40
@@ -133,6 +138,7 @@ def create_dataset(dir_dataset, filename, basis_set,
             N_electrons += atomic_number
             xyz = [float(v) for v in [x, y, z]]
             atomic_coords.append(xyz)
+            #print('atomic_coords!!',atomic_coords,'\n')
 
             """Atomic orbitals (basis functions)
             and principle quantum numbers (q=1,2,...).
@@ -147,15 +153,30 @@ def create_dataset(dir_dataset, filename, basis_set,
                 atomic_orbitals.append(a)
                 orbital_coords.append(xyz)
                 quantum_numbers.append(q)
+#            print('atomic_orbitals!!',atomic_orbitals,'\n')
+#            print('orbital_coords!!',orbital_coords,'\n')
+#            print('quantum_numbers!!',atomic_orbitals,'\n')
+#            import sys
+#            sys.exit()
 
         """Create each data with the above defined functions."""
         atomic_coords = np.array(atomic_coords)
         atomic_orbitals = create_orbitals(atomic_orbitals, orbital_dict)
         field_coords = create_field(sphere, atomic_coords)
         distance_matrix = create_distancematrix(field_coords, atomic_coords)
+#        print('field_coords!!',field_coords.shape,field_coords,'\n')
+#        print('atomic_coords!!',atomic_coords.shape,atomic_coords,'\n')
+#        print('distance_matrix!!',distance_matrix.shape,distance_matrix,'\n')
         atomic_numbers = np.array(atomic_numbers)
         potential = create_potential(distance_matrix, atomic_numbers)
+#        print('potential!!',potential.shape,potential,'\n')
         distance_matrix = create_distancematrix(field_coords, orbital_coords)
+#        print('field_coords2!!',field_coords.shape,field_coords,'\n')
+#        import torch
+#        print('orbital_coords!!',torch.Tensor(orbital_coords).shape,orbital_coords,'\n')
+#        print('distance_matrix2!!',distance_matrix.shape,distance_matrix,'\n')
+#        import sys
+#        sys.exit()
         quantum_numbers = np.array([quantum_numbers])
         N_electrons = np.array([[N_electrons]])
         N_field = len(field_coords)  # The number of points in the grid field.
@@ -167,13 +188,15 @@ def create_dataset(dir_dataset, filename, basis_set,
                 quantum_numbers.astype(np.float32),
                 N_electrons.astype(np.float32),
                 N_field]
+        #print('AO',atomic_orbitals.shape)
+        #print('distance_matrix.shape',distance_matrix.shape)
 
         if property:
             data += [property_values.astype(np.float32),
                      potential.astype(np.float32)]
 
         data = np.array(data, dtype=object)
-        np.save(dir_preprocess + idx, data)
+        np.save(dir_path + idx, data)
 
 
 if __name__ == "__main__":
@@ -206,21 +229,21 @@ if __name__ == "__main__":
     print('-'*50)
 
     print('Training dataset...')
-    create_dataset(dir_dataset, 'train',
+    create_dataset(dir_dataset, 'under15_train',
                    basis_set, radius, grid_interval, orbital_dict)
     print('-'*50)
 
     print('Validation dataset...')
-    create_dataset(dir_dataset, 'val',
+    create_dataset(dir_dataset, 'under15_valid',
                    basis_set, radius, grid_interval, orbital_dict)
     print('-'*50)
 
     print('Test dataset...')
-    create_dataset(dir_dataset, 'test',
+    create_dataset(dir_dataset, 'under15_test',
                    basis_set, radius, grid_interval, orbital_dict)
     print('-'*50)
-
-    with open(dir_dataset + 'orbitaldict_' + basis_set + '.pickle', 'wb') as f:
+    temp_dir_dataset = '/data/liuao/deep-DFT/QuantumDeepField_molecule-main/train/'
+    with open(temp_dir_dataset + 'orbitaldict_' + basis_set + '.pickle', 'wb') as f:
         pickle.dump(dict(orbital_dict), f)
 
     print('The preprocess has finished.')
