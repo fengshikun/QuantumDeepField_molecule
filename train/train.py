@@ -151,7 +151,7 @@ class QuantumDeepField(nn.Module):
 
     def functional(self, vectors, layers, operation, axis):
         """DNN-based energy functional."""
-#        vectors = self.W_pre_func(vectors)
+        vectors = self.W_pre_func(vectors)
         for l in range(layers):
             vectors = torch.relu(self.W_functional[l](vectors))
         if operation == 'sum':
@@ -191,7 +191,7 @@ class QuantumDeepField(nn.Module):
             E_xcH = self.W_property(final_layer)
                       
             #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
-            E_n = V_n * densities
+            E_n = torch.sum(V_n * densities)
             E_ = E_xcH + E_n
             loss1 = F.mse_loss(E, E_)
             if (epoch%2==1):                
@@ -216,8 +216,8 @@ class QuantumDeepField(nn.Module):
                 num2 = (molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]).sum()
                 dim_num += data[2][i].shape[0]               
                 epsilon.append(num1/num2) 
-                print(epsilon.shape)
-                print(epsilon)
+                # print(epsilon.shape)
+                # print(epsilon)
             temp_loss = []
             dim_num = 0
             for i in range(batch_num):
