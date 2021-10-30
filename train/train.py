@@ -194,9 +194,7 @@ class QuantumDeepField(nn.Module):
             E_n = torch.sum(V_n * densities)
             E_ = E_xcH + E_n
             loss1 = F.mse_loss(E, E_)
-            if (epoch%2==1):                
-                return loss1
-            
+                       
             grad_v = []
             batch_num = len(data[2])            
             for i in range(batch_num):
@@ -207,27 +205,15 @@ class QuantumDeepField(nn.Module):
                 V_xcH[dim_num:dim_num + data[2][i].shape[0]] = grad_v[i][dim_num:dim_num + data[2][i].shape[0]]
                 dim_num += data[2][i].shape[0]
             V = V_xcH +V_n
-            #1 we solve epsilon for each molecular, there are batch_size moleculars
-            batch_num = len(data[2])
-            epsilon = []
-            dim_num = 0
-            for i in range(batch_num):
-                num1 = ((V[dim_num:dim_num + data[2][i].shape[0]]*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]-1/2*l_molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]])*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]).sum()
-                num2 = (molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]]).sum()
-                dim_num += data[2][i].shape[0]               
-                epsilon.append(num1/num2) 
-                # print(epsilon.shape)
-                # print(epsilon)
-            temp_loss = []
-            dim_num = 0
-            for i in range(batch_num):
-                #I don't know why it occurs wrongs, it tell me RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation. Solve: I copy the epsilon[i], make them point to different address
-                epis = copy.copy(epsilon[i])
-                temp_op2 = molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone()*epis
-                temp_loss.append(F.mse_loss(V[dim_num:dim_num + data[2][i].shape[0]].clone()*molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone()-1/2*l_molecular_orbitals[dim_num:dim_num + data[2][i].shape[0]].clone(),temp_op2))
-                dim_num +=data[2][i].shape[0]
-            loss2 = sum(temp_loss)            
-            return loss2
+            
+            loss2=0        
+            mat = molecular_orbitals*V-1/2*l_molecular_orbitals
+            dim=0
+            for j in range(batch_num):
+                dim_mole=data[2][j].shape[0]
+                loss2 += torch.sum(torch.sum(torch.square(mat[dim:dim+dim_mole,:]),0)-torch.sum(torch.square(molecular_orbitals[dim:dim+dim_mole,:]*mat[dim:dim+dim_mole,:]),0)/torch.sum(torch.square(molecular_orbitals[dim:dim+dim_mole,:]),0)    )          
+                dim += dim_mole            
+            return loss ,loss1, loss2/(batch_num)
             
 
         else:  # Test.
@@ -259,11 +245,13 @@ class Trainer(object):
         """Minimize two loss functions in terms of E and V."""
         losses = 0
         for data in dataloader:
-            loss = self.model.forward(data, epoch, train=True)
+            loss,loss1,loss2 = self.model.forward(data, epoch, train=True)
             self.optimize(loss, self.optimizer)
-            losses += loss.item()    
+            losses += loss.item()   
+            lossE += loss1.item()
+            lossV += loss2.item()
         self.scheduler.step()
-        return losses
+        return losses, lossE, lossV
 
 
 class Tester(object):
@@ -444,7 +432,7 @@ if __name__ == "__main__":
     start = timeit.default_timer()
 
     for epoch in range(iteration):
-        loss= trainer.train(dataloader_train, epoch)
+        loss, lossE, lossV= trainer.train(dataloader_train, epoch)
         MAE_val = tester.test(dataloader_val)[0]
         MAE_test, prediction = tester.test(dataloader_test)
         time = timeit.default_timer() - start
@@ -458,8 +446,8 @@ if __name__ == "__main__":
             print('-'*50)
             print(result)
 
-        result = '\t'.join(map(str, [epoch, time, loss,
-                                     MAE_val, MAE_test]))            
+        result = '\t'.join(map(str, [epoch, time, loss, lossE, lossV,
+                                     MAE_val, MAE_test]))          
         f = open('loss.txt', 'a+')
         f.write(str(loss))
         f.write('\n')
