@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output,
-                 hidden_HK, layer_HK, use_d=False):
+                 hidden_HK, layer_HK, use_d=False, density_only=False):
         super(QuantumDeepField, self).__init__()
 
         """All learning parameters of the QDF model."""
@@ -43,6 +43,7 @@ class QuantumDeepField(nn.Module):
         self.layer_HK = layer_HK
 
         self.use_d = use_d
+        self.density_only = density_only
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
@@ -82,7 +83,7 @@ class QuantumDeepField(nn.Module):
         """
         zetas = torch.squeeze(self.zeta(atomic_orbitals))
         GTOs = (distance_matrices**(quantum_numbers-1) *
-                torch.exp(-zetas*distance_matrices**2))
+                torch.exp(-zetas**2*distance_matrices**2))
         
         # GTOs = F.normalize(GTOs, 2, 0)
         # # print(torch.sum(torch.t(GTOs)[0]**2))  # Normalization check.
@@ -162,9 +163,9 @@ class QuantumDeepField(nn.Module):
                 index += 1
             return torch.cat(normalized_MOs), torch.cat(l_normalized_MOs)
 
-    def functional(self, vectors, layers, operation, axis, use_d=False):
+    def functional(self, vectors, layers, operation, axis, use_d=False, density_only=False):
         """DNN-based energy functional."""
-        if use_d:
+        if use_d or density_only:
             vectors = torch.relu(self.W_pre_func(vectors))
         for l in range(layers):
             vectors = torch.relu(self.W_functional[l](vectors))
@@ -191,16 +192,20 @@ class QuantumDeepField(nn.Module):
         if predict:  # For demo.
             with torch.no_grad():
                 molecular_orbitals = self.LCAO(inputs)
-                if self.use_d:
+                if self.use_d or self.density_only:
                     densities = torch.sum(molecular_orbitals ** 2, 1)
                     densities = torch.unsqueeze(densities, 1)
-                    final_layer = self.functional(molecular_orbitals,
+                    final_layer = self.functional(densities,
                                               self.layer_functional,
-                                              self.operation, N_fields, use_d=self.use_d)
-                    V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
-                    E_xcH = self.W_property(final_layer)
-                    E_n = torch.sum(V_n * densities)
-                    E_ = E_xcH + E_n
+                                              self.operation, N_fields, use_d=self.use_d,density_only=self.density_only)
+    
+                    if self.density_only:
+                        E_ = self.W_property(final_layer)
+                    else:
+                        V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
+                        E_xcH = self.W_property(final_layer)
+                        E_n = torch.sum(V_n * densities)
+                        E_ = E_xcH + E_n
                 else:
                     final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
@@ -212,7 +217,14 @@ class QuantumDeepField(nn.Module):
             molecular_orbitals = self.LCAO(inputs)
             if target == 'E':  # Supervised learning for energy.
                 E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
-                final_layer = self.functional(molecular_orbitals,
+                if self.density_only:
+                    densities = torch.sum(molecular_orbitals ** 2, 1)
+                    densities = torch.unsqueeze(densities, 1)
+                    final_layer = self.functional(densities,
+                                              self.layer_functional,
+                                              self.operation, N_fields, density_only=True)
+                else:
+                    final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
                                               self.operation, N_fields)
                 E_ = self.W_property(final_layer)  # Predicted E.
@@ -264,20 +276,25 @@ class QuantumDeepField(nn.Module):
             with torch.no_grad():
                 E = self.list_to_batch(data[6], cat=True, axis=0)
                 molecular_orbitals = self.LCAO(inputs)
-                if self.use_d:
+                if self.use_d or self.density_only:
                     densities = torch.sum(molecular_orbitals ** 2, 1)
                     densities = torch.unsqueeze(densities, 1)
+                    final_layer = self.functional(densities,
+                                              self.layer_functional,
+                                              self.operation, N_fields, use_d=self.use_d, density_only=self.density_only)
+    
+                    if self.density_only:
+                        E_ = self.W_property(final_layer)
+                    else:
+                        V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
+                        E_xcH = self.W_property(final_layer)
+                        E_n = torch.sum(V_n * densities)
+                        E_ = E_xcH + E_n
+                else:
                     final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
-                                              self.operation, N_fields, use_d=self.use_d)
-                final_layer = self.functional(molecular_orbitals,
-                                              self.layer_functional,
                                               self.operation, N_fields)
-                # E_ = self.W_property(final_layer)
-                V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
-                E_xcH = self.W_property(final_layer)
-                E_n = torch.sum(V_n * densities)
-                E_ = E_xcH + E_n
+                    E_ = self.W_property(final_layer)
                 return idx, E, E_
 
 
@@ -410,6 +427,7 @@ if __name__ == "__main__":
     parser.add_argument('iteration', type=int)
     parser.add_argument('setting')
     parser.add_argument('num_workers', type=int)
+    parser.add_argument('density_only', type=bool, default=False, help='QDF only use density')
     parser.add_argument('lambdaV', type=float, default=1.0, help='weight of lossV')
     parser.add_argument('use_d', type=bool, default=False, help='whether use the target D')
     parser.add_argument('lambdaD', type=float, default=1.0, help='weight of lossD')
