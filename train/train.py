@@ -229,13 +229,14 @@ class QuantumDeepField(nn.Module):
                                               self.operation, N_fields)
                 E_ = self.W_property(final_layer)  # Predicted E.
                 loss = F.mse_loss(E, E_)
+                return loss
             if target == 'V':  # Unsupervised learning for potential.
                 V = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
                 densities = torch.sum(molecular_orbitals**2, 1)
                 densities = torch.unsqueeze(densities, 1)
                 V_ = self.HKmap(densities, self.layer_HK)  # Predicted V.
                 loss = F.mse_loss(V, V_)
-            
+                return loss
             if target == 'D':
                 E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
                 molecular_orbitals, l_molecular_orbitals = self.LCAO(inputs,laplace = True)
@@ -427,10 +428,11 @@ if __name__ == "__main__":
     parser.add_argument('iteration', type=int)
     parser.add_argument('setting')
     parser.add_argument('num_workers', type=int)
-    parser.add_argument('density_only', type=bool, default=False, help='QDF only use density')
+    
     parser.add_argument('lambdaV', type=float, default=1.0, help='weight of lossV')
-    parser.add_argument('use_d', type=bool, default=False, help='whether use the target D')
     parser.add_argument('lambdaD', type=float, default=1.0, help='weight of lossD')
+    parser.add_argument('--use_d', dest='use_d', action='store_true', help='whether use the target D')
+    parser.add_argument('--density_only', dest='density_only', action='store_true', help='QDF only use density')
     args = parser.parse_args()
     dataset = args.dataset
     unit = '(' + dataset.split('_')[-1] + ')'
@@ -497,7 +499,7 @@ if __name__ == "__main__":
     print('Set a QDF model.')
     model = QuantumDeepField(device, N_orbitals,
                              dim, layer_functional, operation, N_output,
-                             hidden_HK, layer_HK, use_d=args.use_d).to(device)
+                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d).to(device)
     trainer = Trainer(model, lr, lr_decay, step_size, lambdaV=args.lambdaV, use_d=args.use_d, lambdaD=args.lambdaD)
     tester = Tester(model)
     print('# of model parameters:',
