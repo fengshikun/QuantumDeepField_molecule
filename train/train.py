@@ -175,7 +175,16 @@ class QuantumDeepField(nn.Module):
                 final_layer = self.functional(densities,
                                               self.layer_functional,
                                               self.operation, N_fields)
-                E_ = self.W_property(final_layer)
+                E_xcH = self.W_property(final_layer)
+                d_n = 0      
+                E_n=torch.zeros(4,1)
+                E_k=torch.zeros(4,1)            
+                for i in range(batch_num):
+                    d_ni=data[2][i].shape[0]
+                    E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                    E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                    d_n += d_ni
+                E_ = E_xcH + E_n - E_k 
                 return idx, E_
 
         elif train:            
@@ -189,10 +198,16 @@ class QuantumDeepField(nn.Module):
                                           self.layer_functional,
                                           self.operation, N_fields)
             E_xcH = self.W_property(final_layer)
-                      
-            #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
-            E_n = torch.sum(V_n * densities)
-            E_ = E_xcH + E_n
+                                     
+            d_n = 0      
+            E_n=torch.zeros(4,1)
+            E_k=torch.zeros(4,1)            
+            for i in range(batch_num):
+                d_ni=data[2][i].shape[0]
+                E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                d_n += d_ni
+            E_ = E_xcH + E_n - E_k 
             loss1 = F.mse_loss(E, E_)
                        
             grad_v = []
@@ -225,7 +240,16 @@ class QuantumDeepField(nn.Module):
                 final_layer = self.functional(densities,
                                               self.layer_functional,
                                               self.operation, N_fields)
-                E_ = self.W_property(final_layer)
+                E_xcH = self.W_property(final_layer)
+                d_n = 0      
+                E_n=torch.zeros(4,1)
+                E_k=torch.zeros(4,1)            
+                for i in range(batch_num):
+                    d_ni=data[2][i].shape[0]
+                    E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                    E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                    d_n += d_ni
+                E_ = E_xcH + E_n - E_k 
                 return idx, E, E_
 
 
