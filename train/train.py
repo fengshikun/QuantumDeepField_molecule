@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output,
-                 hidden_HK, layer_HK, use_d=False, density_only=False):
+                 hidden_HK, layer_HK, use_d=False, density_only=False, en_scale=1.0):
         super(QuantumDeepField, self).__init__()
 
         """All learning parameters of the QDF model."""
@@ -44,6 +44,7 @@ class QuantumDeepField(nn.Module):
 
         self.use_d = use_d
         self.density_only = density_only
+        self.en_scale = en_scale
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
@@ -204,8 +205,19 @@ class QuantumDeepField(nn.Module):
                     else:
                         V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
                         E_xcH = self.W_property(final_layer)
-                        E_n = torch.sum(V_n * densities)
-                        E_ = E_xcH + E_n
+                        # E_ = E_xcH
+                        d_n = 0
+                        batch_num = E_xcH.size()[0]
+                        E_n=torch.zeros_like(E_xcH)
+                        E_k=torch.zeros_like(E_xcH)            
+                        for i in range(batch_num):
+                            d_ni=data[2][i].shape[0]
+                            E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                            E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                            d_n += d_ni
+                        E_ = E_xcH + E_n - E_k
+                        # E_n = torch.sum(V_n * densities)
+                        # E_ = E_xcH + E_n*self.en_scale
                 else:
                     final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
@@ -214,8 +226,8 @@ class QuantumDeepField(nn.Module):
                 return idx, E_
 
         elif train:
-            molecular_orbitals = self.LCAO(inputs)
             if target == 'E':  # Supervised learning for energy.
+                molecular_orbitals = self.LCAO(inputs)
                 E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
                 if self.density_only:
                     densities = torch.sum(molecular_orbitals ** 2, 1)
@@ -231,6 +243,7 @@ class QuantumDeepField(nn.Module):
                 loss = F.mse_loss(E, E_)
                 return loss
             if target == 'V':  # Unsupervised learning for potential.
+                molecular_orbitals = self.LCAO(inputs)
                 V = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
                 densities = torch.sum(molecular_orbitals**2, 1)
                 densities = torch.unsqueeze(densities, 1)
@@ -247,11 +260,25 @@ class QuantumDeepField(nn.Module):
                                             self.layer_functional,
                                             self.operation, N_fields, use_d=True)
                 E_xcH = self.W_property(final_layer)
-                        
-                #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
-                E_n = torch.sum(V_n * densities)
-                E_ = E_xcH + E_n
+
+                d_n = 0
+                batch_num = E_xcH.size()[0]
+                E_n=torch.zeros_like(E_xcH)
+                E_k=torch.zeros_like(E_xcH)            
+                for i in range(batch_num):
+                    d_ni=data[2][i].shape[0]
+                    E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                    E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                    d_n += d_ni
+                E_ = E_xcH + E_n - E_k 
                 loss1 = F.mse_loss(E, E_)
+
+                # #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
+                # E_n = torch.sum(V_n * densities)
+                # # import pdb; pdb.set_trace()
+                # E_ = E_xcH + E_n*self.en_scale
+                # # E_ = E_xcH
+                # loss1 = F.mse_loss(E, E_)
                         
                 grad_v = []
                 batch_num = len(data[2])            
@@ -289,8 +316,20 @@ class QuantumDeepField(nn.Module):
                     else:
                         V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
                         E_xcH = self.W_property(final_layer)
-                        E_n = torch.sum(V_n * densities)
-                        E_ = E_xcH + E_n
+                        # E_ = E_xcH
+                        d_n = 0
+                        batch_num = E_xcH.size()[0]
+                        E_n=torch.zeros_like(E_xcH)
+                        E_k=torch.zeros_like(E_xcH)            
+                        for i in range(batch_num):
+                            d_ni=data[2][i].shape[0]
+                            E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
+                            E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                            d_n += d_ni
+                        E_ = E_xcH + E_n - E_k 
+
+                        # E_n = torch.sum(V_n * densities)
+                        # E_ = E_xcH + E_n*self.en_scale
                 else:
                     final_layer = self.functional(molecular_orbitals,
                                               self.layer_functional,
@@ -431,8 +470,12 @@ if __name__ == "__main__":
     
     parser.add_argument('lambdaV', type=float, default=1.0, help='weight of lossV')
     parser.add_argument('lambdaD', type=float, default=1.0, help='weight of lossD')
+    parser.add_argument('--en_scale', dest="en_scale", type=float, default=1.0, help='weight of En')
     parser.add_argument('--use_d', dest='use_d', action='store_true', help='whether use the target D')
     parser.add_argument('--density_only', dest='density_only', action='store_true', help='QDF only use density')
+
+    parser.add_argument('--eprefix', dest='eprefix', type=str, default="cur_exp", help="event folder prefix")
+
     args = parser.parse_args()
     dataset = args.dataset
     unit = '(' + dataset.split('_')[-1] + ')'
@@ -499,7 +542,7 @@ if __name__ == "__main__":
     print('Set a QDF model.')
     model = QuantumDeepField(device, N_orbitals,
                              dim, layer_functional, operation, N_output,
-                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d).to(device)
+                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d, en_scale=args.en_scale).to(device)
     trainer = Trainer(model, lr, lr_decay, step_size, lambdaV=args.lambdaV, use_d=args.use_d, lambdaD=args.lambdaD)
     tester = Tester(model)
     print('# of model parameters:',
@@ -524,7 +567,7 @@ if __name__ == "__main__":
     start = timeit.default_timer()
 
 
-    tb_logger = SummaryWriter('events')
+    tb_logger = SummaryWriter('{}_events'.format(args.eprefix))
 
     for epoch in range(iteration):
         loss_E, loss_V = trainer.train(dataloader_train)
