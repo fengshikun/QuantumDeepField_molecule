@@ -540,7 +540,7 @@ if __name__ == "__main__":
     print('-'*50)
 
     """Create the dataloaders of training, val, and test set."""
-    dir_dataset = '../dataset/' + dataset + '/'
+    dir_dataset = '../../dataset/' + dataset + '/'
     field = '_'.join([basis_set, radius + 'sphere', grid_interval + 'grid/'])
     # dataset_train = MyDataset(dir_dataset + 'train_' + field)
     # dataset_val = MyDataset(dir_dataset + 'val_' + field)
