@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output,
-                 hidden_HK, layer_HK, use_d=False, density_only=False, en_scale=1.0):
+                 hidden_HK, layer_HK, use_d=False, density_only=False, exch_scale=1.0):
         super(QuantumDeepField, self).__init__()
 
         """All learning parameters of the QDF model."""
@@ -44,7 +44,7 @@ class QuantumDeepField(nn.Module):
 
         self.use_d = use_d
         self.density_only = density_only
-        self.en_scale = en_scale
+        self.exch_scale = exch_scale
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
@@ -215,7 +215,7 @@ class QuantumDeepField(nn.Module):
                             E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
                             E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                             d_n += d_ni
-                        E_ = E_xcH + E_n - E_k
+                        E_ = self.exch_scale * E_xcH + E_n - E_k
                         # E_n = torch.sum(V_n * densities)
                         # E_ = E_xcH + E_n*self.en_scale
                 else:
@@ -270,7 +270,7 @@ class QuantumDeepField(nn.Module):
                     E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
                     E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                     d_n += d_ni
-                E_ = E_xcH + E_n - E_k 
+                E_ = self.exch_scale * E_xcH + E_n - E_k 
                 loss1 = F.mse_loss(E, E_)
 
                 # #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
@@ -303,7 +303,7 @@ class QuantumDeepField(nn.Module):
         else:  # Test.
             with torch.no_grad():
                 E = self.list_to_batch(data[6], cat=True, axis=0)
-                molecular_orbitals = self.LCAO(inputs)
+                molecular_orbitals, l_molecular_orbitals = self.LCAO(inputs,laplace = True)
                 if self.use_d or self.density_only:
                     densities = torch.sum(molecular_orbitals ** 2, 1)
                     densities = torch.unsqueeze(densities, 1)
@@ -326,7 +326,7 @@ class QuantumDeepField(nn.Module):
                             E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
                             E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                             d_n += d_ni
-                        E_ = E_xcH + E_n - E_k 
+                        E_ = self.exch_scale * E_xcH + E_n - E_k 
 
                         # E_n = torch.sum(V_n * densities)
                         # E_ = E_xcH + E_n*self.en_scale
@@ -339,9 +339,38 @@ class QuantumDeepField(nn.Module):
 
 
 class Trainer(object):
-    def __init__(self, model, lr, lr_decay, step_size, lambdaV=1.0, use_d=False, lambdaD=0.01):
+    def __init__(self, model, lr, lr_decay, step_size, lambdaV=1.0, use_d=False, lambdaD=0.01, orbit_lrdecay=1, load_path=""):
         self.model = model
-        self.optimizer = optim.Adam(self.model.parameters(), lr)
+
+        # resume from step1:
+        def map_func(storage, location):
+            return storage.cuda()
+        if load_path:
+            checkpoint = torch.load(load_path, map_location=map_func)
+            self.model.load_state_dict(checkpoint)
+
+        # split the parameter into two parts
+        orbit_params = list(map(id, model.coefficient.parameters()))
+        orbit_params += list(map(id, model.zeta.parameters()))
+        
+        rest_params = filter(lambda x: id(x) not in orbit_params, model.parameters())
+
+
+        if orbit_lrdecay == 0:
+        # freeze the orbit parameter
+            for name, p in model.named_parameters():
+                if name.startswith("coefficient") or name.startswith("zeta"):
+                    p.requires_grad = False
+                    print("Freeze the weight of {}".format(name))
+        
+            self.optimizer = optim.Adam(rest_params, lr)
+        else:
+            self.optimizer = optim.Adam([{'params':rest_params,'lr':lr},
+                        {'params':model.coefficient.parameters(),'lr':lr * orbit_lrdecay},
+                        {'params':model.zeta.parameters(),'lr':lr * orbit_lrdecay}
+                        ])
+
+        # self.optimizer = optim.Adam(self.model.parameters(), lr)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer,
                                                    step_size, lr_decay)
         self.lambdaV = lambdaV
@@ -470,11 +499,13 @@ if __name__ == "__main__":
     
     parser.add_argument('lambdaV', type=float, default=1.0, help='weight of lossV')
     parser.add_argument('lambdaD', type=float, default=1.0, help='weight of lossD')
-    parser.add_argument('--en_scale', dest="en_scale", type=float, default=1.0, help='weight of En')
+    parser.add_argument('--exch_scale', dest="exch_scale", type=float, default=1.0, help='weight of En')
     parser.add_argument('--use_d', dest='use_d', action='store_true', help='whether use the target D')
     parser.add_argument('--density_only', dest='density_only', action='store_true', help='QDF only use density')
 
     parser.add_argument('--eprefix', dest='eprefix', type=str, default="cur_exp", help="event folder prefix")
+    parser.add_argument('--load_path', dest='load_path', type=str, default="", help="if the training process is two-step, this var specify the first step model path")
+    parser.add_argument('--orbit_lrdecay', dest="orbit_lrdecay", type=float, default=1.0, help='lr decay of orbital parameters')
 
     args = parser.parse_args()
     dataset = args.dataset
@@ -542,21 +573,23 @@ if __name__ == "__main__":
     print('Set a QDF model.')
     model = QuantumDeepField(device, N_orbitals,
                              dim, layer_functional, operation, N_output,
-                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d, en_scale=args.en_scale).to(device)
-    trainer = Trainer(model, lr, lr_decay, step_size, lambdaV=args.lambdaV, use_d=args.use_d, lambdaD=args.lambdaD)
+                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d, exch_scale=args.exch_scale).to(device)
+    trainer = Trainer(model, lr, lr_decay, step_size, lambdaV=args.lambdaV, use_d=args.use_d, lambdaD=args.lambdaD, orbit_lrdecay=args.orbit_lrdecay, load_path=args.load_path)
     tester = Tester(model)
     print('# of model parameters:',
           sum([np.prod(p.size()) for p in model.parameters()]))
     print('-'*50)
 
     """Output files."""
-    file_result = '../output/result--' + setting + '.txt'
+    file_result = "result_log.txt"
     result = ('Epoch\tTime(sec)\tLoss_E\tLoss_V\t'
               'MAE_val' + unit + '\tMAE_test' + unit)
     with open(file_result, 'w') as f:
         f.write(result + '\n')
-    file_prediction = '../output/prediction--' + setting + '.txt'
-    file_model = '../output/model--' + setting
+    file_prediction = 'prediction.txt'
+    file_model = 'model.pth'
+
+
 
     print('Start training of the QDF model with', dataset, 'dataset.\n'
           'The training result is displayed in this terminal every epoch.\n'
