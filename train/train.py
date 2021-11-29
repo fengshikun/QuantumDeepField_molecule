@@ -252,6 +252,7 @@ class QuantumDeepField(nn.Module):
                 loss = F.mse_loss(V, V_)
                 return loss
             if target == 'D':
+                statistics_dict = {}
                 E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
                 molecular_orbitals, l_molecular_orbitals = self.LCAO(inputs,laplace = True)
                 V_n = self.list_to_batch(data[7], cat=True, axis=0)  # Correct V.
@@ -271,7 +272,15 @@ class QuantumDeepField(nn.Module):
                     E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
                     E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                     d_n += d_ni
-                E_ = self.exch_scale * E_xcH + self.en_scale * E_n + E_k 
+                E_ = self.exch_scale * E_xcH + self.en_scale * E_n + E_k
+
+                mole_ratio = torch.sum(molecular_orbitals * l_molecular_orbitals < 0) / (molecular_orbitals.shape[0] * molecular_orbitals.shape[1])
+                statistics_dict = {
+                    "E_xcH": torch.mean(E_xcH),
+                    "En": torch.mean(E_n),
+                    "Ek": torch.mean(E_k),
+                    "mole_ratio": mole_ratio
+                }
                 loss1 = F.mse_loss(E, E_)
 
                 # #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
@@ -299,7 +308,7 @@ class QuantumDeepField(nn.Module):
                     dim_mole=data[2][j].shape[0]
                     loss2 += torch.sum(torch.sum(torch.square(mat[dim:dim+dim_mole,:]),0)-torch.sum(torch.square(molecular_orbitals[dim:dim+dim_mole,:]*mat[dim:dim+dim_mole,:]),0)/torch.sum(torch.square(molecular_orbitals[dim:dim+dim_mole,:]),0)    )          
                     dim += dim_mole            
-                return loss1, loss2/(batch_num)
+                return loss1, loss2/(batch_num), statistics_dict
 
         else:  # Test.
             with torch.no_grad():
@@ -387,9 +396,10 @@ class Trainer(object):
     def train(self, dataloader):
         """Minimize two loss functions in terms of E and V."""
         losses_E, losses_V = 0, 0
+        statistics_dict = {}
         for data in dataloader:
             if self.use_d:
-                loss_E, loss_V = self.model.forward(data, train=True, target='D')
+                loss_E, loss_V, statistics_dict = self.model.forward(data, train=True, target='D')
                 total_loss = loss_E + self.lambdaD * loss_V
                 self.optimize(total_loss, self.optimizer)
                 losses_E += loss_E.item()
@@ -403,7 +413,9 @@ class Trainer(object):
                 self.optimize(loss_V, self.optimizer)
                 losses_V += loss_V.item()
         self.scheduler.step()
-        return losses_E, losses_V
+
+        return losses_E, losses_V, statistics_dict
+
 
 
 class Tester(object):
@@ -606,7 +618,7 @@ if __name__ == "__main__":
     tb_logger = SummaryWriter('{}_events'.format(args.eprefix))
 
     for epoch in range(iteration):
-        loss_E, loss_V = trainer.train(dataloader_train)
+        loss_E, loss_V, statistics_dict = trainer.train(dataloader_train)
         MAE_val = tester.test(dataloader_val)[0]
         MAE_test, prediction = tester.test(dataloader_test)
         time = timeit.default_timer() - start
@@ -627,6 +639,9 @@ if __name__ == "__main__":
         tb_logger.add_scalar('loss_V', loss_V, epoch)
         tb_logger.add_scalar('MAE_val', float(MAE_val), epoch)
         tb_logger.add_scalar('MAE_test', float(MAE_test), epoch)
+        if len(statistics_dict):
+            for k in statistics_dict:
+                tb_logger.add_scalar(k, statistics_dict[k], epoch)
 
         tester.save_result(result, file_result)
         tester.save_prediction(prediction, file_prediction)
