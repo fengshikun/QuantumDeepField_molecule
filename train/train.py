@@ -214,7 +214,7 @@ class QuantumDeepField(nn.Module):
                         for i in range(batch_num):
                             d_ni=data[2][i].shape[0]
                             E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
-                            E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                            E_k[i] = -torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                             d_n += d_ni
                         E_ = self.exch_scale * E_xcH + self.en_scale * E_n + E_k
                         # E_n = torch.sum(V_n * densities)
@@ -270,16 +270,29 @@ class QuantumDeepField(nn.Module):
                 for i in range(batch_num):
                     d_ni=data[2][i].shape[0]
                     E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
-                    E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                    E_k[i] = -torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                     d_n += d_ni
                 E_ = self.exch_scale * E_xcH + self.en_scale * E_n + E_k
 
                 mole_ratio = torch.sum(molecular_orbitals * l_molecular_orbitals < 0) / (molecular_orbitals.shape[0] * molecular_orbitals.shape[1])
+                
+                # zeta and coeffi
+                zeta_sq = self.zeta.weight**2
+                min_coeffe = self.coefficient.weight[torch.argmin(zeta_sq)]
+                max_coeffe = self.coefficient.weight[torch.argmax(zeta_sq)]
+                med_zeta = torch.median(zeta_sq)
+                med_idx = (zeta_sq == med_zeta.item()).nonzero(as_tuple=True)[0]
+                med_coeffe = self.coefficient.weight[med_idx]
+                
                 statistics_dict = {
                     "E_xcH": torch.mean(E_xcH),
                     "En": torch.mean(E_n),
                     "Ek": torch.mean(E_k),
-                    "mole_ratio": mole_ratio
+                    "mole_ratio": mole_ratio,
+                    "zeta_sq": zeta_sq,
+                    "min_coeffe": min_coeffe,
+                    "max_coeffe": max_coeffe,
+                    "med_coeffe": med_coeffe
                 }
                 loss1 = F.mse_loss(E, E_)
 
@@ -334,7 +347,7 @@ class QuantumDeepField(nn.Module):
                         for i in range(batch_num):
                             d_ni=data[2][i].shape[0]
                             E_n[i] = torch.sum(V_n[d_n:d_n+d_ni] * densities[d_n:d_n+d_ni]) 
-                            E_k[i]=  torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
+                            E_k[i] = -torch.sum(molecular_orbitals[d_n:d_n +d_ni] * l_molecular_orbitals[d_n:d_n + d_ni]  )/2
                             d_n += d_ni
                         E_ = self.exch_scale * E_xcH + self.en_scale * E_n + E_k 
 
@@ -641,7 +654,10 @@ if __name__ == "__main__":
         tb_logger.add_scalar('MAE_test', float(MAE_test), epoch)
         if len(statistics_dict):
             for k in statistics_dict:
-                tb_logger.add_scalar(k, statistics_dict[k], epoch)
+                if k in ["zeta_sq", "min_coeffe", "max_coeffe", "med_coeffe"]:
+                    tb_logger.add_histogram(k, statistics_dict[k], epoch)
+                else:
+                    tb_logger.add_scalar(k, statistics_dict[k], epoch)
 
         tester.save_result(result, file_result)
         tester.save_prediction(prediction, file_prediction)
