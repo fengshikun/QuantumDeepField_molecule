@@ -241,7 +241,7 @@ class QuantumDeepField(nn.Module):
                                               self.layer_functional,
                                               self.operation, N_fields)
                 E_ = self.W_property(final_layer)  # Predicted E.
-                loss = F.mse_loss(E, E_)
+                loss = F.smooth_l1_loss(E, E_)
                 return loss
             if target == 'V':  # Unsupervised learning for potential.
                 molecular_orbitals = self.LCAO(inputs)
@@ -249,7 +249,7 @@ class QuantumDeepField(nn.Module):
                 densities = torch.sum(molecular_orbitals**2, 1)
                 densities = torch.unsqueeze(densities, 1)
                 V_ = self.HKmap(densities, self.layer_HK)  # Predicted V.
-                loss = F.mse_loss(V, V_)
+                loss = F.smooth_l1_loss(V, V_)
                 return loss
             if target == 'D':
                 statistics_dict = {}
@@ -294,14 +294,14 @@ class QuantumDeepField(nn.Module):
                     "max_coeffe": max_coeffe,
                     "med_coeffe": med_coeffe
                 }
-                loss1 = F.mse_loss(E, E_)
+                loss1 = F.smooth_l1_loss(E, E_)
 
                 # #2 for each molecular's loss, we have an epsilon.we sum them to the total loss and backward         
                 # E_n = torch.sum(V_n * densities)
                 # # import pdb; pdb.set_trace()
                 # E_ = E_xcH + E_n*self.en_scale
                 # # E_ = E_xcH
-                # loss1 = F.mse_loss(E, E_)
+                # loss1 = F.smooth_l1_loss(E, E_)
                         
                 grad_v = []
                 batch_num = len(data[2])            
