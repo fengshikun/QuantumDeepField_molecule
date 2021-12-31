@@ -340,7 +340,7 @@ class QuantumDeepField(nn.Module):
                     d_n += d_ni
                 
                 E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k_lst
-
+                E_ = torch.unsqueeze(E_, 1)
             return idx, E_
 
         elif train:
@@ -494,7 +494,7 @@ class QuantumDeepField(nn.Module):
                     d_n += d_ni
                 
                 E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k_lst
-
+                E_ = torch.unsqueeze(E_, 1)
             return idx, E, E_
 
 
@@ -568,6 +568,8 @@ class Trainer(object):
                         tb_logger.add_histogram(k, statistics_dict[k], epoch)
                     else:
                         tb_logger.add_scalar(k, statistics_dict[k], epoch)
+            
+            # break
 
         self.scheduler.step()
 
