@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import copy
+import math
 import torch.nn.functional as F
 """
 directly from https://github.com/legendongary/pytorch-gram-schmidt/blob/master/gram_schmidt.py
@@ -237,12 +239,221 @@ class AttentNelectron(nn.Module):
         #     coeff[idx] = V[idx][indices[idx]]
         return output_clip.transpose(0, 1) # Ne x N_cut
 
+
+class Attention(nn.Module):
+    """
+    Compute 'Scaled Dot Product SelfAttention
+    """
+
+    def forward(self, query, key, value, mask=None, dropout=None):
+        """
+        :param query:
+        :param key:
+        :param value:
+        :param mask:
+        :param dropout:
+        :return:
+        """
+        scores = torch.matmul(query, key.transpose(-2, -1)) \
+                 / math.sqrt(query.size(-1))
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        p_attn = F.softmax(scores, dim=-1)
+
+        if dropout is not None:
+            p_attn = dropout(p_attn)
+
+        return torch.matmul(p_attn, value), p_attn
+
+
+class MultiHeadedAttention(nn.Module):
+    """
+    The multi-head attention module. Take in model size and number of heads.
+    """
+
+    def __init__(self, h, d_model, dropout=0.1, bias=False):
+        """
+
+        :param h:
+        :param d_model:
+        :param dropout:
+        :param bias:
+        """
+        super().__init__()
+        assert d_model % h == 0
+
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h  # number of heads
+
+        self.linear_layers = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(3)])  # why 3: query, key, value
+        self.output_linear = nn.Linear(d_model, d_model, bias)
+        self.attention = Attention()
+
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        """
+
+        :param query:
+        :param key:
+        :param value:
+        :param mask:
+        :return:
+        """
+        batch_size = query.size(0)
+
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        query, key, value = [l(x).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
+                             for l, x in zip(self.linear_layers, (query, key, value))]
+
+        # 2) Apply attention on all the projected vectors in batch.
+        x, _ = self.attention(query, key, value, mask=mask, dropout=self.dropout)
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.h * self.d_k)
+
+        return self.output_linear(x)
+
+class PositionwiseFeedForward(nn.Module): 
+	def __init__(self, d_model, d_ff, dropout=0.1):
+		super(PositionwiseFeedForward, self).__init__()
+		self.w_1 = nn.Linear(d_model, d_ff)
+		self.w_2 = nn.Linear(d_ff, d_model)
+		self.dropout = nn.Dropout(dropout)
+	
+	def forward(self, x):
+		return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+def clones(module, N):
+	# 克隆N个完全相同的SubLayer，使用了copy.deepcopy
+	return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+class Encoder(nn.Module):
+	"Encoder是N个EncoderLayer的stack"
+	def __init__(self, layer, N):
+		super(Encoder, self).__init__()
+		self.layers = clones(layer, N)
+		self.norm = LayerNorm(layer.size)
+	
+	def forward(self, x, mask):
+		for layer in self.layers:
+			x = layer(x, mask)
+		return self.norm(x)
+
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class SublayerConnection(nn.Module):
+	"""
+	LayerNorm + sublayer(Self-Attenion/Dense) + dropout + 残差连接
+	"""
+	def __init__(self, size, dropout):
+		super(SublayerConnection, self).__init__()
+		self.norm = LayerNorm(size)
+		self.dropout = nn.Dropout(dropout)
+	
+	def forward(self, x, sublayer):
+		return x + self.dropout(sublayer(self.norm(x)))
+
+class EncoderLayer(nn.Module):
+	"EncoderLayer由self-attn和feed forward组成"
+	def __init__(self, size, self_attn, feed_forward, dropout):
+		super(EncoderLayer, self).__init__()
+		self.self_attn = self_attn
+		self.feed_forward = feed_forward
+		self.sublayer = clones(SublayerConnection(size, dropout), 2)
+		self.size = size
+
+	def forward(self, x, mask):
+		"Follow Figure 1 (left) for connections."
+		x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+		return self.sublayer[1](x, self.feed_forward)
+
+class PositionalEncoding(nn.Module): 
+	def __init__(self, d_model, dropout, max_len=5000):
+		super(PositionalEncoding, self).__init__()
+		self.dropout = nn.Dropout(p=dropout)
+		
+		# Compute the positional encodings once in log space.
+		pe = torch.zeros(max_len, d_model)
+		position = torch.arange(0, max_len).unsqueeze(1)
+		div_term = torch.exp(torch.arange(0, d_model, 2) *
+			-(math.log(10000.0) / d_model))
+		pe[:, 0::2] = torch.sin(position * div_term)
+		pe[:, 1::2] = torch.cos(position * div_term)
+		pe = pe.unsqueeze(0)
+		self.register_buffer('pe', pe)
+
+	def forward(self, x):
+		x = x + self.pe[:, :x.size(1)].detach()
+		return self.dropout(x)
+
+
+class AttentNelectronMHA(nn.Module):
+    """
+    G and Ne are padding number
+    """
+    def __init__(self, G, Ne, hidden_dim=512, d_ff=2048, head_num=8, mha_num=2, dropout=0.1):
+        super(AttentNelectronMHA, self).__init__()
+        self.G = G
+        self.Ne = Ne
+        self.pre_linear = nn.Linear(G, hidden_dim)
+        self.mha_num = mha_num
+
+        c = copy.deepcopy
+        attn = MultiHeadedAttention(head_num, hidden_dim)
+        ff = PositionwiseFeedForward(hidden_dim, d_ff, dropout)
+        
+        self.position = PositionalEncoding(hidden_dim, dropout)
+        self.encoder = Encoder(EncoderLayer(hidden_dim, c(attn), c(ff), dropout), mha_num)
+        # self.Q_functional = nn.ModuleList([MultiHeadedAttention(head_num, hidden_dim)
+        #                                    for _ in range(mha_num)])
+        self.post_linear = nn.Linear(hidden_dim, Ne)
+
+        
+    
+    def reset_params(self):
+        for p in self.encoder.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform(p)
         
 
+    # phi shape: Bs x N_cut x G
+    def forward(self, phi):
+        x = self.pre_linear(phi)
+        x = self.position(x)
+        # mask is none
+        x = self.encoder(x, None)
+        x = self.post_linear(x)
+        return x
+
+        
+
+
 if __name__ == "__main__":
-    a = torch.randn(5, 6, requires_grad=True)
-    c = torch.randn(5, 6, requires_grad=True)
-    b = gram_schmidt(a)
-    gram_schmidt_pair(a, c)
-    coeff, phi_gto, phi_gto_lap = torch.randn((3, 4)), torch.randn((4, 4)), torch.randn((4, 4))
-    get_orbital(coeff, phi_gto, phi_gto_lap)
+    # a = torch.randn(5, 6, requires_grad=True)
+    # c = torch.randn(5, 6, requires_grad=True)
+    # b = gram_schmidt(a)
+    # gram_schmidt_pair(a, c)
+    # coeff, phi_gto, phi_gto_lap = torch.randn((3, 4)), torch.randn((4, 4)), torch.randn((4, 4))
+    # get_orbital(coeff, phi_gto, phi_gto_lap)
+
+    x = torch.rand((3, 123, 321))
+
+
+    model = AttentNelectronMHA(321, 100)
+    res = model(x)
+    print(res)

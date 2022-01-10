@@ -59,6 +59,8 @@ class QuantumDeepField(nn.Module):
 
         self.ceff_module = AttentNelectron(self.G_max, self.N_el_max)
 
+        self.ceff_encoder = AttentNelectronMHA(self.G_max, self.N_el_max)
+
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
         xs = [dtype(x).to(self.device) for x in xs]
@@ -149,12 +151,12 @@ class QuantumDeepField(nn.Module):
         
         # Todo get coefficients from network
         """Normalize the coefficients in LCAO."""
-        coefficients = []
-        for AOs in atomic_orbitals:
-            coefs = F.normalize(self.coefficient(AOs), 2, 0)
-            # print(torch.sum(torch.t(coefs)[0]**2))  # Normalization check.
-            coefficients.append(coefs)
-        coefficients = torch.cat(coefficients)
+        # coefficients = []
+        # for AOs in atomic_orbitals:
+        #     coefs = F.normalize(self.coefficient(AOs), 2, 0)
+        #     # print(torch.sum(torch.t(coefs)[0]**2))  # Normalization check.
+        #     coefficients.append(coefs)
+        # coefficients = torch.cat(coefficients)
         # todo sample wise (coefficients is different per sample)
         
         # split the matrix
@@ -165,27 +167,52 @@ class QuantumDeepField(nn.Module):
         basis_matrix_lst = split_matrix(basis_matrix_all, N_fields, quantum_numbers_lst)
         l_basis_matrix_list = split_matrix(l_basis_matrix_all, N_fields, quantum_numbers_lst)
         
+        # padding to same dimension
+        coeffi_input = torch.zeros((len(basis_matrix_lst), self.N_cut_max, self.G_max)).cuda()
+        for i, basis_matrix in enumerate(basis_matrix_lst):
+            basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
+            coeffi_input[i, : basis_matrix_t.shape[0], :basis_matrix_t.shape[1]] = basis_matrix_t
 
 
         psi_lst = []
         psi_lap_lst = []
         psi_cpl_lst = []
         psi_cpl_lap_lst = []
-        
+
+        coeffi_batch = self.ceff_encoder(coeffi_input)
+
         for i, basis_matrix in enumerate(basis_matrix_lst):
-            # Transpose
             basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
             l_basis_matrix_t = torch.transpose(l_basis_matrix_list[i], 0, 1) # Nc X G
-            # todo coefficients is sample-wise different
-            coeffi = self.ceff_module(basis_matrix_t, N_electrons_lst[i])
-
-            psi, psi_lap = get_orbital(coeffi, basis_matrix_t, l_basis_matrix_t)
+            coeffi_matrix = coeffi_batch[i,:basis_matrix_t.shape[0], :int(N_electrons_lst[i])].t()
+            psi, psi_lap = get_orbital(coeffi_matrix, basis_matrix_t, l_basis_matrix_t)
             psi_cpl, psi_cpl_lap = get_complement_orbital(basis_matrix_t, l_basis_matrix_t, psi, psi_lap)
-            
+
             psi_lst.append(psi)
             psi_lap_lst.append(psi_lap)
             psi_cpl_lst.append(psi_cpl)
-            psi_cpl_lap_lst.append(psi_cpl_lap)
+            psi_cpl_lap_lst.append(psi_cpl_lap)            
+
+
+        # psi_lst = []
+        # psi_lap_lst = []
+        # psi_cpl_lst = []
+        # psi_cpl_lap_lst = []
+        
+        # for i, basis_matrix in enumerate(basis_matrix_lst):
+        #     # Transpose
+        #     basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
+        #     l_basis_matrix_t = torch.transpose(l_basis_matrix_list[i], 0, 1) # Nc X G
+        #     # todo coefficients is sample-wise different
+        #     coeffi = self.ceff_module(basis_matrix_t, N_electrons_lst[i])
+
+        #     psi, psi_lap = get_orbital(coeffi, basis_matrix_t, l_basis_matrix_t)
+        #     psi_cpl, psi_cpl_lap = get_complement_orbital(basis_matrix_t, l_basis_matrix_t, psi, psi_lap)
+            
+        #     psi_lst.append(psi)
+        #     psi_lap_lst.append(psi_lap)
+        #     psi_cpl_lst.append(psi_cpl)
+        #     psi_cpl_lap_lst.append(psi_cpl_lap)
 
         return psi_lst, psi_lap_lst, psi_cpl_lst, psi_cpl_lap_lst
 
