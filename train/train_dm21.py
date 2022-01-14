@@ -16,19 +16,21 @@ import torch.utils.data
 import sys
 from util2 import *
 from tensorboardX import SummaryWriter
-
+torch.set_default_tensor_type(torch.DoubleTensor)
 
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output, grid_interval,
-                 hidden_HK, layer_HK, use_d=False, density_only=False, exch_scale=1.0, en_scale=1.0):
+                 hidden_HK, layer_HK, use_d=False, density_only=False, exch_scale=1.0, en_scale=1.0,
+                 mha_num=2):
         super(QuantumDeepField, self).__init__()
 
         """All learning parameters of the QDF model."""
         self.coefficient = nn.Embedding(N_orbitals, dim)
         self.zeta = nn.Embedding(N_orbitals, 1)  # Orbital exponent.
-        nn.init.ones_(self.zeta.weight)  # Initialize each zeta with one.
-        
+        #nn.init.ones_(self.zeta.weight)  # Initialize each zeta with one.
+        #nn.init.uniform_(self.zeta.weight, a=0.1, b=2.4)
+        nn.init.normal_(self.zeta.weight, mean=1, std=1)
         self.G_max = 840
         self.N_cut_max = 130
         self.N_el_max = 68
@@ -60,7 +62,7 @@ class QuantumDeepField(nn.Module):
         self.N_el_max = 68
 
         # self.ceff_module = AttentNelectron(self.G_max, self.N_el_max)
-        self.ceff_encoder = AttentNelectronMHA(self.G_max, self.N_el_max)
+        self.ceff_encoder = AttentNelectronMHA(self.G_max, self.N_el_max, mha_num=mha_num)
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
@@ -106,7 +108,7 @@ class QuantumDeepField(nn.Module):
         # # print(torch.sum(torch.t(GTOs)[0]**2))  # Normalization check.
         # return GTOs
 
-        denom = GTOs.norm(2, 0, True).clamp_min(1e-12).expand_as(GTOs) * grid_interval**(3/2)
+        denom = GTOs.norm(2, 0, True).clamp_min(1e-12).expand_as(GTOs) * self.grid_interval**(3/2)
         n_GTOs = GTOs/denom
         
         if laplace == False:
@@ -129,7 +131,7 @@ class QuantumDeepField(nn.Module):
 #                       +(quantum_numbers-2)*(quantum_numbers-1))
             n_l_GTOs=l_GTOs/denom
             
-            
+            #print('rank gto',n_GTOs.shape,np.linalg.matrix_rank(n_GTOs.cpu().detach().numpy()))
             if all:
                 return n_GTOs,n_g_GTOs, n_l_GTOs
             else:
@@ -182,7 +184,6 @@ class QuantumDeepField(nn.Module):
         l_basis_matrix_list = split_matrix(l_basis_matrix_all, N_fields, quantum_numbers_lst)
         g_basis_matrix_list = split_matrix(g_basis_matrix_all, N_fields, quantum_numbers_lst)
         
-
         # padding to same dimension
         coeffi_input = torch.zeros((len(basis_matrix_lst), self.N_cut_max, self.G_max)).cuda()
         for i, basis_matrix in enumerate(basis_matrix_lst):
@@ -197,16 +198,19 @@ class QuantumDeepField(nn.Module):
         psi_gra_lst = []
 
         coeffi_batch = self.ceff_encoder(coeffi_input)
-
+        
         for i, basis_matrix in enumerate(basis_matrix_lst):
             basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
             l_basis_matrix_t = torch.transpose(l_basis_matrix_list[i], 0, 1) # Nc X G
             g_basis_matrix_t = torch.transpose(g_basis_matrix_list[i], 0, 1) # Nc X G
             coeffi_matrix = coeffi_batch[i,:basis_matrix_t.shape[0], :int(N_electrons_lst[i])].t()
             
-            psi, psi_gra, psi_lap = get_orbital(coeffi_matrix, basis_matrix_t, g_basis_matrix_t, l_basis_matrix_t, grid_interval)
-            psi_cpl, psi_cpl_lap = get_complement_orbital(basis_matrix_t, l_basis_matrix_t, psi, psi_lap, grid_interval)
+            psi, psi_gra, psi_lap = get_orbital(coeffi_matrix, basis_matrix_t, g_basis_matrix_t, l_basis_matrix_t, self.grid_interval)
+            psi_cpl, psi_cpl_lap = get_complement_orbital(basis_matrix_t, l_basis_matrix_t, psi, psi_lap, self.grid_interval)
 
+            #print(torch.matmul(psi, torch.transpose(psi, 0, 1)) * self.grid_interval**3)
+            #print(torch.matmul(psi, torch.transpose(psi_cpl, 0, 1)) * self.grid_interval**3)
+            #print(torch.matmul(psi_cpl, torch.transpose(psi_cpl, 0, 1)) * self.grid_interval**3)
             psi_lst.append(psi)
             psi_gra_lst.append(psi_gra)
             psi_lap_lst.append(psi_lap)
@@ -372,9 +376,9 @@ class QuantumDeepField(nn.Module):
         elif train:
             # with torch.autograd.set_detect_anomaly(True):
             statistics_dict = {}
-            E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
+            E = self.list_to_batch(data[6], cat=True, axis=0).double()  # Correct E. 32
             # V_n = self.list_to_batch(data[7], cat=True, axis=0)
-            V_n_lst = data[7]
+            V_n_lst = data[7] #list
             psi_lst, psi_gra_lst, psi_lap_lst, psi_cpl_lst, psi_cpl_lap_lst = self.LCAO2(inputs)
 
             # way1 psi --> Vxch (Network)
@@ -608,6 +612,7 @@ class Trainer(object):
             # with torch.autograd.set_detect_anomaly(True):
             loss_E, diag_loss, gt_con_loss, statistics_dict = self.model.forward(data, train=True, target='D')
             total_loss = loss_E + lossV_weight * (diag_loss +  gt_con_loss)
+            #print(total_loss.dtype)
             self.optimize(total_loss, self.optimizer)
             losses_E += loss_E.item()
             losses_diag += diag_loss.item()
@@ -736,6 +741,8 @@ if __name__ == "__main__":
     parser.add_argument('--load_path', dest='load_path', type=str, default="", help="if the training process is two-step, this var specify the first step model path")
     parser.add_argument('--orbit_lrdecay', dest="orbit_lrdecay", type=float, default=1.0, help='lr decay of orbital parameters')
 
+    parser.add_argument('--mha_num', dest="mha_num", type=int, default=2, help='mha layers number of coefficent network')
+
     args = parser.parse_args()
     dataset = args.dataset
     unit = '(' + dataset.split('_')[-1] + ')'
@@ -754,6 +761,8 @@ if __name__ == "__main__":
     iteration = args.iteration
     setting = args.setting
     num_workers = args.num_workers
+
+    mha_num = args.mha_num
 
     """Fix the random seed (with the taxicab number)."""
     torch.manual_seed(1729)
@@ -803,7 +812,7 @@ if __name__ == "__main__":
     print('Set a QDF model.')
     model = QuantumDeepField(device, N_orbitals,
                              dim, layer_functional, operation, N_output, float(grid_interval),
-                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d, exch_scale=args.exch_scale, en_scale=args.en_scale).to(device)
+                             hidden_HK, layer_HK, density_only=args.density_only, use_d=args.use_d, exch_scale=args.exch_scale, en_scale=args.en_scale, mha_num=mha_num).to(device)
     trainer = Trainer(model, lr, lr_decay, step_size, use_d=args.use_d, orbit_lrdecay=args.orbit_lrdecay, load_path=args.load_path)
     tester = Tester(model)
     print('# of model parameters:',
