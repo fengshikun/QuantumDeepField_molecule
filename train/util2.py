@@ -3,6 +3,7 @@ import torch.nn as nn
 import copy
 import math
 import torch.nn.functional as F
+import numpy as np #++
 """
 directly from https://github.com/legendongary/pytorch-gram-schmidt/blob/master/gram_schmidt.py
 """
@@ -35,6 +36,8 @@ def gram_schmidt(vv):
 def gram_schmidt_triple(vv,vv1, vv2, grid_interval):
     
     nk = vv.size(0) #Ne
+    ng= vv.size(1) #G
+    rank=np.linalg.matrix_rank(vv.cpu().detach().numpy())#++
     uu = torch.zeros_like(vv, device=vv.device) #Ne X G
     uu1 = torch.zeros_like(vv1, device=vv.device)
     uu2 = torch.zeros_like(vv2, device=vv.device)
@@ -53,12 +56,22 @@ def gram_schmidt_triple(vv,vv1, vv2, grid_interval):
         uk = vk - torch.mv(torch.transpose(umat,0,1), mv)
         uk1 = vk1 - torch.mv(torch.transpose(umat1,0,1), mv)
         uk2 = vk2 - torch.mv(torch.transpose(umat2,0,1), mv)
-        denom = uk.norm() * grid_interval**(3/2)
-        uu[k, :] = uk / denom
-        uu1[k, :] = uk1 / denom
-        uu2[k, :] = uk2 / denom      
+        denom = uk.norm() * grid_interval**(3/2)        
+        #print(rank,k,denom, torch.matmul(uu[0:k, :], uk))
+        uu[k, :] = uk / denom  
+        #print(torch.matmul(uu[0:k, :],uu[k, :]).norm() * grid_interval**(3/2))
+        #print(torch.matmul(uu[0:k, :],torch.transpose(uu[0:k, :],0,1))* grid_interval**3)
+                
+        if rank < nk and torch.matmul(uu[0:k, :],uu[k, :]).norm() * grid_interval**(3/2)>1:
+            uu[k, :] = torch.zeros(1,ng)    
+            uu1[k, :] =  torch.zeros(1,ng)   
+            uu2[k, :] =  torch.zeros(1,ng)   
+        else:
+            uu1[k, :] = uk1 / denom
+            uu2[k, :] = uk2 / denom      
         
-#    print(torch.mm(uu,torch.transpose(uu,0,1)))  # othognal check.
+    #print(torch.mm(uu,torch.transpose(uu,0,1))* grid_interval**3)  # othognal check.
+    print(rank,nk,np.linalg.matrix_rank(uu.cpu().detach().numpy()))
     return uu, uu1, uu2
 
 def gram_schmidt_pair(vv,vv1, vv2):
@@ -114,9 +127,10 @@ psi_lap: Ne X G
 psi: 
 """
 def get_orbital(coeff, phi_gto, phi_gto_gra, phi_gto_lap, grid_interval):
+    
     psi_zero = torch.matmul(coeff, phi_gto)
     psi_zero_lap = torch.matmul(coeff, phi_gto_lap)
-    psi_zero_gra = torch.matmul(coeff, phi_gto_gra)
+    psi_zero_gra = torch.matmul(coeff, phi_gto_gra)   
     psi, psi_gra, psi_lap = gram_schmidt_triple(psi_zero, psi_zero_gra, psi_zero_lap, grid_interval)
     return psi, psi_gra, psi_lap
 
@@ -158,7 +172,7 @@ def get_complement_orbital(phi_gto, phi_gto_lap, psi, psi_lap, grid_interval):
     # keep non_zero (Nc - Ne) rows of psi_cpl and the corresponding rows of psi_lap_cpl
     # keep top-k norm rows
     psi_cpl_norm = torch.norm(psi_cpl, dim=1) * grid_interval**(3/2)
-    psi_lap_cpl_norm = torch.norm(psi_lap_cpl, dim=1) * grid_interval**(3/2)
+    psi_lap_cpl_norm = torch.norm(psi_lap_cpl, dim=1) * grid_interval**(3/2)#????
     
     #normalization
     k = phi_gto.shape[0] - psi.shape[0] # Nc - Ne
@@ -502,9 +516,24 @@ class AttentNelectronMHA(nn.Module):
 
 
 if __name__ == "__main__":
-    a = torch.randn(5, 6, requires_grad=True)
-    c = torch.randn(5, 6, requires_grad=True)
-    b = gram_schmidt(a)
-    gram_schmidt_pair(a, c)
-    coeff, phi_gto, phi_gto_lap = torch.randn((3, 4)), torch.randn((4, 4)), torch.randn((4, 4))
-    get_orbital(coeff, phi_gto, phi_gto_lap)
+    G=100
+    Ne=40
+    Nc=80
+    scale=0.01
+    coeff, phi_gto, phi_gto_gra, phi_gto_lap = torch.randn((Ne,Nc)), torch.ones((Nc,G))+torch.randn((Nc,G))*scale, torch.randn((Nc,G)), torch.randn((Nc,G))
+    #phi_gto=torch.ones((Nc,G))
+    #phi_gto[1][0]=1.001
+    grid_interval=0.3
+    psi, psi_gra, psi_lap=get_orbital(coeff, phi_gto, phi_gto_gra, phi_gto_lap, grid_interval)
+    psi_cpl_n, psi_lap_cpl_n=get_complement_orbital(phi_gto, phi_gto_lap, psi, psi_lap, grid_interval)
+    #print(psi)
+'''
+import numpy as np
+np.linalg.matrix_rank(phi_gto.cpu().detach().numpy()),Nc
+np.linalg.matrix_rank(torch.matmul(coeff,phi_gto).cpu().detach().numpy()),Ne
+np.linalg.matrix_rank(psi.cpu().detach().numpy()),Ne
+np.linalg.matrix_rank(psi_cpl_n.cpu().detach().numpy()),Nc-Ne
+torch.matmul(psi, torch.transpose(psi, 0, 1)) * grid_interval**3
+torch.matmul(psi_cpl_n, torch.transpose(psi, 0, 1)) * grid_interval**3 
+torch.matmul(psi_cpl_n, torch.transpose(psi_cpl_n, 0, 1)) * grid_interval**3 
+'''
