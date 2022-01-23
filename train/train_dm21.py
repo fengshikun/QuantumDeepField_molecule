@@ -17,7 +17,7 @@ import sys
 from util2 import *
 from tensorboardX import SummaryWriter
 torch.set_default_tensor_type(torch.DoubleTensor)
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 class QuantumDeepField(nn.Module):
     def __init__(self, device, N_orbitals,
                  dim, layer_functional, operation, N_output, grid_interval,
@@ -62,7 +62,7 @@ class QuantumDeepField(nn.Module):
         self.N_el_max = 68
 
         # self.ceff_module = AttentNelectron(self.G_max, self.N_el_max)
-        self.ceff_encoder = AttentNelectronMHA(self.G_max, self.N_el_max, mha_num=mha_num)
+        self.ceff_encoder = AttentNelectronMHA(2*self.G_max, self.N_el_max, mha_num=mha_num)
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
@@ -84,7 +84,22 @@ class QuantumDeepField(nn.Module):
         pad_matrices = torch.full((M, N), pad_value, device=self.device)
         i, j = 0, 0
         for k, matrix in enumerate(matrices):
-            matrix = torch.FloatTensor(matrix).to(self.device)
+            matrix = torch.Tensor(matrix).to(self.device) #FloatTensor
+            m, n = shapes[k]
+            pad_matrices[i:i+m, j:j+n] = matrix
+            i += m
+            j += n
+        return pad_matrices
+
+    def pad_t(self, matrices, pad_value):
+        """
+        Pad the list of tensor with a pad_value 
+        """
+        shapes = [m.shape for m in matrices]
+        M, N = sum([s[0] for s in shapes]), sum([s[1] for s in shapes])
+        pad_matrices = torch.full((M, N), pad_value, device=self.device)
+        i, j = 0, 0
+        for k, matrix in enumerate(matrices):
             m, n = shapes[k]
             pad_matrices[i:i+m, j:j+n] = matrix
             i += m
@@ -179,14 +194,19 @@ class QuantumDeepField(nn.Module):
         # basis_matrix_lst = torch.split(basis_matrix_all, N_fields)
         # l_basis_matrix_list = torch.split(l_basis_matrix_all, N_fields)
 
-
-        basis_matrix_lst = split_matrix(basis_matrix_all, N_fields, quantum_numbers_lst)
+       
+        basis_matrix_list = split_matrix(basis_matrix_all, N_fields, quantum_numbers_lst)
         l_basis_matrix_list = split_matrix(l_basis_matrix_all, N_fields, quantum_numbers_lst)
         g_basis_matrix_list = split_matrix(g_basis_matrix_all, N_fields, quantum_numbers_lst)
+         
+         #add spin in GTO
+        basis_matrix_spin_lst = [self.pad_t([temp_mat,temp_mat], 0.) for temp_mat in basis_matrix_list]
+        l_basis_matrix_spin_lst = [self.pad_t([temp_mat,temp_mat], 0.) for temp_mat in l_basis_matrix_list]
+        g_basis_matrix_spin_lst = [self.pad_t([temp_mat,temp_mat], 0.) for temp_mat in g_basis_matrix_list]
         
         # padding to same dimension
-        coeffi_input = torch.zeros((len(basis_matrix_lst), self.N_cut_max, self.G_max)).cuda()
-        for i, basis_matrix in enumerate(basis_matrix_lst):
+        coeffi_input = torch.zeros((len(basis_matrix_spin_lst), self.N_cut_max *2, self.G_max *2)).cuda()
+        for i, basis_matrix in enumerate(basis_matrix_spin_lst):
             basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
             coeffi_input[i, : basis_matrix_t.shape[0], :basis_matrix_t.shape[1]] = basis_matrix_t
 
@@ -199,11 +219,11 @@ class QuantumDeepField(nn.Module):
 
         coeffi_batch = self.ceff_encoder(coeffi_input)
         
-        for i, basis_matrix in enumerate(basis_matrix_lst):
-            basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # Nc X G
-            l_basis_matrix_t = torch.transpose(l_basis_matrix_list[i], 0, 1) # Nc X G
-            g_basis_matrix_t = torch.transpose(g_basis_matrix_list[i], 0, 1) # Nc X G
-            coeffi_matrix = coeffi_batch[i,:basis_matrix_t.shape[0], :int(N_electrons_lst[i])].t()
+        for i, basis_matrix in enumerate(basis_matrix_spin_lst):
+            basis_matrix_t = torch.transpose(basis_matrix, 0, 1) # 2Nc X 2G
+            l_basis_matrix_t = torch.transpose(l_basis_matrix_spin_lst[i], 0, 1) # 2Nc X2 G
+            g_basis_matrix_t = torch.transpose(g_basis_matrix_spin_lst[i], 0, 1) # Nc X 2G
+            coeffi_matrix = coeffi_batch[i,:basis_matrix_t.shape[0], :int(N_electrons_lst[i])].t()  # Ne X 2Nc
             
             psi, psi_gra, psi_lap = get_orbital(coeffi_matrix, basis_matrix_t, g_basis_matrix_t, l_basis_matrix_t, self.grid_interval)
             psi_cpl, psi_cpl_lap = get_complement_orbital(basis_matrix_t, l_basis_matrix_t, psi, psi_lap, self.grid_interval)
@@ -282,7 +302,7 @@ class QuantumDeepField(nn.Module):
     def functional(self, vectors, layers):
         """DNN-based energy functional."""
 
-        vectors = torch.relu(self.W_pre_func(vectors))
+        vectors = torch.relu(self.W_pre_func(vectors)) #2G*N_el_max-->2G*dim
         for l in range(layers):
             vectors = torch.relu(self.W_functional[l](vectors))
         # if operation == 'sum':
@@ -323,12 +343,12 @@ class QuantumDeepField(nn.Module):
                 v_input = torch.cat(v_input_lst, dim=0)
 
                 V_xcH = self.functional(v_input,
-                                            self.layer_functional) # G X 1
+                                            self.layer_functional) # 2G X 1
                 # way2 get density rou
                 densities_lst = []
-                for psi in psi_lst: # Nel x G
-                    psi_t = psi.transpose(0, 1) # G x Nel
-                    dt = torch.sum(psi_t ** 2, 1)
+                for psi in psi_lst: # Nel x 2G
+                    # psi_t = psi.transpose(0, 1) # 2G x Nel
+                    dt = torch.sum(psi_t ** 2, 0)
                     dt = torch.unsqueeze(dt, 1)
                     densities_lst.append(dt)
                 densities = torch.cat(densities_lst)
@@ -379,28 +399,63 @@ class QuantumDeepField(nn.Module):
             E = self.list_to_batch(data[6], cat=True, axis=0).double()  # Correct E. 32
             # V_n = self.list_to_batch(data[7], cat=True, axis=0)
             V_n_lst = data[7] #list
-            psi_lst, psi_gra_lst, psi_lap_lst, psi_cpl_lst, psi_cpl_lap_lst = self.LCAO2(inputs)
-
+            psi_lst_spin, psi_gra_lst_spin, psi_lap_lst_spin, psi_cpl_lst_spin, psi_cpl_lap_lst_spin = self.LCAO2(inputs)
+            
+            # psi with spin ne*2G--> without spin ne*G
             # way1 psi --> Vxch (Network)
             # for network propagation we need pad the N_el and transpose
-            v_input_lst = []
-            for ps in psi_lst:
-                pst = ps.transpose(0, 1)
-                pst_pad = padding_matrix(pst, self.N_el_max)
-                v_input_lst.append(pst_pad)
-            v_input = torch.cat(v_input_lst, dim=0)
+            v_input_lst, psi_lst, psi_cpl_lst = [], [], []
+            densities_spin_lst, densities_lst, K_lst, K_cpl_lst = [], [], [] ,[] 
+            batch_num = len(data[0])            
+            E_k = torch.zeros(batch_num).cuda()         
+            for i in range(batch_num):
+                ps_spin = psi_lst_spin[i]
+                ps_cpl_spin = psi_cpl_lst_spin[i]
+                ps_cpl_lap_spin = psi_cpl_lap_lst_spin[i]
+                ps_gra_spin = psi_gra_lst_spin[i]
+                ps_lap_spin = psi_lap_lst_spin[i]
+                dim_G = int(ps_spin.shape[1]/2)
+                ps = (ps_spin[:,0:dim_G]**2 + ps_spin[:,dim_G:dim_G*2]**2).sqrt()
+                ps_cpl = (ps_cpl_spin[:,0:dim_G]**2 + ps_cpl_spin[:,dim_G:dim_G*2]**2).sqrt()
+                ps_cpl_lap = (ps_cpl_lap_spin[:,0:dim_G]**2 + ps_cpl_lap_spin[:,dim_G:dim_G*2]**2).sqrt() #不对，偷懒了
+                ps_gra = (ps_gra_spin[:,0:dim_G]*ps_spin[:,0:dim_G]+ps_gra_spin[:,dim_G:dim_G*2]*ps_spin[:,dim_G:dim_G*2])/ps
+                ps_lap = - ps_gra**2/ps + (ps_lap_spin[:,0:dim_G]*ps_spin[:,0:dim_G]+ps_gra_spin[:,0:dim_G]**2+ps_lap_spin[:,dim_G:dim_G*2]*ps_spin[:,dim_G:dim_G*2]+ps_gra_spin[:,dim_G:dim_G*2]**2)/ps
+                psi_lst.append(ps)
+                psi_cpl_lst.append(ps_cpl)
 
-            V_xcH = self.functional(v_input,
-                                        self.layer_functional) # G X 1
-            #prepare dm21 input
-            # way2 get density rou
-            densities_lst = []
-            for psi in psi_lst: # Nel x G
-                psi_t = psi.transpose(0, 1) # G x Nel #是否有必要转置？
-                dt = torch.sum(psi_t ** 2, 1)
+                pst_spin = ps_spin.transpose(0, 1)
+                pst_spin_pad = padding_matrix(pst_spin, self.N_el_max)
+                v_input_lst.append(pst_spin_pad)
+                dt = torch.sum(ps_spin ** 2, 0)
+                dt = torch.unsqueeze(dt, 1)
+                densities_spin_lst.append(dt)
+                dt = torch.sum(ps ** 2, 0)
                 dt = torch.unsqueeze(dt, 1)
                 densities_lst.append(dt)
+               
+                K = -0.5 * torch.matmul(ps, ps_lap.transpose(0, 1)) * grid_interval**3
+                K_cpl = -0.5 * torch.matmul(ps_cpl, ps_cpl_lap.transpose(0, 1)) * grid_interval**3
+                K_lst.append(K)
+                K_cpl_lst.append(K_cpl)                
+                E_k[i] = torch.sum(torch.diagonal(K))
+            v_spin_input = torch.cat(v_input_lst, dim=0)
+            densities_spin = torch.cat(densities_spin_lst)
             densities = torch.cat(densities_lst)
+            
+            V_xcH_spin = self.functional(v_spin_input,
+                                        self.layer_functional) # 2G X 1  batch 如何并行？权值共享？
+            V_xcH = V_xcH_spin[0:int(V_xcH_spin.shape[0]/2),:] + V_xcH_spin[int(V_xcH_spin.shape[0]/2):V_xcH_spin.shape[0],:] 
+            
+            #两种方法，一种用无自旋psi做输入，网络则与原来一样；另一种用有自旋psi做输入，网络输出为有自旋的V。
+            #prepare dm21 input
+            # way2 get density rou
+            """ densities_lst = []
+            for psi in psi_lst: # Nel x 2G
+                # psi_t = psi.transpose(0, 1) # G x Nel #是否有必要转置？
+                dt = torch.sum(psi ** 2, 0)
+                dt = torch.unsqueeze(dt, 1)
+                densities_lst.append(dt)
+            densities = torch.cat(densities_lst) """
             
             #gradient of density
 #            densities_gra_lst = []
@@ -413,19 +468,19 @@ class QuantumDeepField(nn.Module):
        
             
 
-            # todo sample wise
+            """ # todo sample wise
             batch_num = len(data[0])
             K_lst = []
             K_cpl_lst = []
-            tau_lst = []
-            densities_gra_lst = []
-            E_k_lst = torch.zeros(batch_num).cuda()
+            # tau_lst = []
+            # densities_gra_lst = []
+            E_k = torch.zeros(batch_num).cuda()
             for i, psi in enumerate(psi_lst):
                 psi_lap = psi_lap_lst[i]
                 psi_gra = psi_gra_lst[i]
                 psi_cpl = psi_cpl_lst[i]
                 psi_cpl_lap = psi_cpl_lap_lst[i]
-                
+                '''
                 # gradient of density(r)
                 # print('shape', psi_gra.shape, psi.shape)
                 densities_gra = 2 * torch.sum(torch.mul(psi,psi_gra), 0 )
@@ -436,7 +491,7 @@ class QuantumDeepField(nn.Module):
                 tau = torch.sum(torch.mul(psi,psi_lap), 0 )            
 #                tau = torch.unsqueeze(tau, 0)
                 tau_lst.append(tau)
-                
+                '''
                 #check boundary condition  psi:Nel*G
                 # print('check1', torch.sum(tau)* grid_interval**3)
                 # print('check2', -torch.sum(torch.mul(psi, psi_gra)* grid_interval**3,1))
@@ -453,7 +508,7 @@ class QuantumDeepField(nn.Module):
                 # get Ek from K
                 E_k = torch.sum(torch.diagonal(K))
                 # E_k_lst.append(E_k)
-                E_k_lst[i] = E_k
+                E_k[i] = E_k """
 
             # get En from (Vn, rou), Exch from (Vxch, rou)
             E_n = torch.zeros(batch_num).cuda()
@@ -468,12 +523,12 @@ class QuantumDeepField(nn.Module):
                 E_xch[i] = -torch.sum(V_xcH[d_n:d_n + d_ni] * densities[d_n:d_n + d_ni]) * grid_interval**3
                 d_n += d_ni
             
-            E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k_lst
+            E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k
 
             statistics_dict = {
                 "E_xcH": torch.mean(E_xch),
                 "En": torch.mean(E_n),
-                "Ek": torch.mean(E_k_lst)
+                "Ek": torch.mean(E_k)
             }
             loss1 = F.smooth_l1_loss(E, torch.unsqueeze(E_, 1))
 
@@ -485,7 +540,7 @@ class QuantumDeepField(nn.Module):
                 V = getV(psi_lst[i], V_total)
                 V_cpl = getV(psi_cpl_lst[i], V_total)
                 diag_loss += diag_constraint_loss(V, K_lst[i])
-                gt_con_loss += get_constraint_loss(V, K_lst[i], V_cpl, K_cpl_lst[i])
+                gt_con_loss += get_constraint_loss(V, K_lst[i], V_cpl, K_cpl_lst[i]) #这两个可以写在一个函数里
             diag_loss /= batch_num
             gt_con_loss /= batch_num
 
@@ -493,53 +548,55 @@ class QuantumDeepField(nn.Module):
 
         else:  # Test.
             with torch.no_grad():
-                E = self.list_to_batch(data[6], cat=True, axis=0)  # Correct E.
+                E = self.list_to_batch(data[6], cat=True, axis=0).double()  # Correct E. 32
                 # V_n = self.list_to_batch(data[7], cat=True, axis=0)
                 V_n_lst = data[7]
-                psi_lst, psi_gra_lst, psi_lap_lst, psi_cpl_lst, psi_cpl_lap_lst = self.LCAO2(inputs)
+                psi_lst_spin, psi_gra_lst_spin, psi_lap_lst_spin, psi_cpl_lst_spin, psi_cpl_lap_lst_spin = self.LCAO2(inputs)
 
                 # way1 psi --> Vxch (Network)
                 # for network propagation we need pad the N_el and transpose
-                v_input_lst = []
-                for ps in psi_lst:
-                    pst = ps.transpose(0, 1)
-                    pst_pad = padding_matrix(pst, self.N_el_max)
-                    v_input_lst.append(pst_pad)
-                v_input = torch.cat(v_input_lst, dim=0)
+                v_input_lst, psi_lst, psi_cpl_lst = [], [], []
+                densities_spin_lst, densities_lst, K_lst, K_cpl_lst = [], [], [] ,[] 
+                batch_num = len(data[0])            
+                E_k = torch.zeros(batch_num).cuda()         
+                for i in range(batch_num):
+                    ps_spin = psi_lst_spin[i]
+                    ps_cpl_spin = psi_cpl_lst_spin[i]
+                    ps_cpl_lap_spin = psi_cpl_lap_lst_spin[i]
+                    ps_gra_spin = psi_gra_lst_spin[i]
+                    ps_lap_spin = psi_lap_lst_spin[i]
+                    dim_G = int(ps_spin.shape[1]/2)
+                    ps = (ps_spin[:,0:dim_G]**2 + ps_spin[:,dim_G:dim_G*2]**2).sqrt()
+                    ps_cpl = (ps_cpl_spin[:,0:dim_G]**2 + ps_cpl_spin[:,dim_G:dim_G*2]**2).sqrt()
+                    ps_cpl_lap = (ps_cpl_lap_spin[:,0:dim_G]**2 + ps_cpl_lap_spin[:,dim_G:dim_G*2]**2).sqrt() #不对，偷懒了
+                    ps_gra = (ps_gra_spin[:,0:dim_G]*ps_spin[:,0:dim_G]+ps_gra_spin[:,dim_G:dim_G*2]*ps_spin[:,dim_G:dim_G*2])/ps
+                    ps_lap = - ps_gra**2/ps + (ps_lap_spin[:,0:dim_G]*ps_spin[:,0:dim_G]+ps_gra_spin[:,0:dim_G]**2+ps_lap_spin[:,dim_G:dim_G*2]*ps_spin[:,dim_G:dim_G*2]+ps_gra_spin[:,dim_G:dim_G*2]**2)/ps
+                    psi_lst.append(ps)
+                    psi_cpl_lst.append(ps_cpl)
 
-                V_xcH = self.functional(v_input,
-                                            self.layer_functional) # G X 1
-                # way2 get density rou
-                densities_lst = []
-                for psi in psi_lst: # Nel x G
-                    psi_t = psi.transpose(0, 1) # G x Nel
-                    dt = torch.sum(psi_t ** 2, 1)
+                    pst_spin = ps_spin.transpose(0, 1)
+                    pst_spin_pad = padding_matrix(pst_spin, self.N_el_max)
+                    v_input_lst.append(pst_spin_pad)
+                    dt = torch.sum(ps_spin ** 2, 0)
+                    dt = torch.unsqueeze(dt, 1)
+                    densities_spin_lst.append(dt)
+                    dt = torch.sum(ps ** 2, 0)
                     dt = torch.unsqueeze(dt, 1)
                     densities_lst.append(dt)
+                
+                    K = -0.5 * torch.matmul(ps, ps_lap.transpose(0, 1)) * grid_interval**3
+                    K_cpl = -0.5 * torch.matmul(ps_cpl, ps_cpl_lap.transpose(0, 1)) * grid_interval**3
+                    K_lst.append(K)
+                    K_cpl_lst.append(K_cpl)                
+                    E_k[i] = torch.sum(torch.diagonal(K))
+                v_spin_input = torch.cat(v_input_lst, dim=0)
+                densities_spin = torch.cat(densities_spin_lst)
                 densities = torch.cat(densities_lst)
                 
-
-                # todo sample wise
-                batch_num = len(data[0])
-                K_lst = []
-                K_cpl_lst = []
-                E_k_lst = torch.zeros(batch_num).cuda()
-                for i, psi in enumerate(psi_lst):
-                    psi_lap = psi_lap_lst[i]
-                    psi_cpl = psi_cpl_lst[i]
-                    psi_cpl_lap = psi_cpl_lap_lst[i]
-                    # way3 psi, psi_lap --> K
-                    K = -0.5 * torch.matmul(psi, psi_lap.transpose(0, 1)) * grid_interval**3
-                    # way4 psi_cpl, psi_cpl_lap --> K_cpl
-                    K_cpl = -0.5 * torch.matmul(psi_cpl, psi_cpl_lap.transpose(0, 1)) * grid_interval**3
-                    K_lst.append(K)
-                    # K_lst[i] = K
-                    # K_cpl_lst[i] = K_cpl
-                    K_cpl_lst.append(K_cpl)
-                    # get Ek from K
-                    E_k = torch.sum(torch.diagonal(K))
-                    # E_k_lst.append(E_k)
-                    E_k_lst[i] = E_k
+                V_xcH_spin = self.functional(v_spin_input,
+                                            self.layer_functional) # 2G X 1  batch 如何并行？权值共享？
+                V_xcH = V_xcH_spin[0:int(V_xcH_spin.shape[0]/2),:] + V_xcH_spin[int(V_xcH_spin.shape[0]/2):V_xcH_spin.shape[0],:] 
+                
 
                 # get En from (Vn, rou), Exch from (Vxch, rou)
                 E_n = torch.zeros(batch_num).cuda()
@@ -554,7 +611,7 @@ class QuantumDeepField(nn.Module):
                     E_xch[i] = -torch.sum(V_xcH[d_n:d_n + d_ni] * densities[d_n:d_n + d_ni]) * grid_interval**3
                     d_n += d_ni
                 
-                E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k_lst
+                E_ = self.exch_scale * E_xch + self.en_scale * E_n + E_k
                 E_ = torch.unsqueeze(E_, 1)
             return idx, E, E_
 
